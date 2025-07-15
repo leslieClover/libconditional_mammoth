@@ -1,0 +1,371 @@
+"""
+Generative Replay components for STAR-Prompt.
+Adaptation of https://github.com/ldeecke/gmm-torch.
+Copyright (c) 2019 Lucas Deecke.
+Licensed under the MIT License.
+"""
+
+import math
+import torch
+import numpy as np
+from math import pi
+
+
+class MixtureOfGaussiansModel(torch.nn.Module):
+    """Mixture of Gaussians model for generative replay"""
+
+    def __init__(self, embed_dim: int, n_components: int = 3, n_iters: int = 100):
+        super().__init__()
+        self.n_iters = n_iters
+        self.gm = GaussianMixture(n_components, embed_dim, covariance_type='diag')
+
+    def fit(self, x):
+        x = x.type(torch.float64)
+        tries = 0
+        while tries < 10:
+            self.gm.fit(x, n_iter=self.n_iters)
+            if self.gm.log_likelihood > -np.inf:
+                break
+            self.gm.to(x.device)
+            tries += 1
+
+        assert (self.gm.var > 0).all(), "Variance is not positive"
+        assert self.gm.log_likelihood > -np.inf, "Log-likelihood is not finite"
+
+    def sample(self, n_sample):
+        return self.gm.sample(n_sample)[0]
+
+    def forward(self, n_sample, *args, **kwargs):
+        return self.sample(n_sample)
+
+
+class Gaussian(torch.nn.Module):
+    """Simple Gaussian model for generative replay"""
+
+    def __init__(self, embed_dim):
+        super(Gaussian, self).__init__()
+        self.embed_dim = embed_dim
+        self.register_buffer("mean", torch.zeros(embed_dim))
+        self.register_buffer("std", torch.ones(embed_dim))
+
+    def fit(self, x):
+        self.std, self.mean = torch.std_mean(x, dim=0)
+
+    def sample(self, n_sample, scale_mean=1.0):
+        return torch.distributions.normal.Normal(scale_mean * self.mean, self.std).sample((n_sample,))
+
+    def forward(self, n_sample, scale_mean: float = 1.0):
+        return self.sample(n_sample, scale_mean)
+
+
+def calculate_matmul_n_times(n_components, mat_a, mat_b):
+    """
+    Calculate matrix product of two matrices with mat_a[0] >= mat_b[0].
+    Bypasses torch.matmul to reduce memory footprint.
+    """
+    res = torch.zeros(mat_a.shape).to(mat_a.device)
+
+    for i in range(n_components):
+        mat_a_i = mat_a[:, i, :, :].squeeze(-2)
+        mat_b_i = mat_b[0, i, :, :].squeeze()
+        res[:, i, :, :] = mat_a_i.mm(mat_b_i).unsqueeze(1)
+
+    return res
+
+
+def calculate_matmul(mat_a, mat_b):
+    """
+    Calculate matrix product of two matrices with mat_a[0] >= mat_b[0].
+    Bypasses torch.matmul to reduce memory footprint.
+    """
+    assert mat_a.shape[-2] == 1 and mat_b.shape[-1] == 1
+    return torch.sum(mat_a.squeeze(-2) * mat_b.squeeze(-1), dim=2, keepdim=True)
+
+
+class GaussianMixture(torch.nn.Module):
+    """
+    Fits a mixture of k=1,..,K Gaussians to the input data.
+    """
+
+    def __init__(self, n_components, n_features, covariance_type="full", eps=1.e-6, init_params="kmeans", mu_init=None,
+                 var_init=None):
+        super(GaussianMixture, self).__init__()
+
+        self.n_components = n_components
+        self.n_features = n_features
+        self.mu_init = mu_init
+        self.var_init = var_init
+        self.eps = eps
+        self.log_likelihood = -np.inf
+        self.covariance_type = covariance_type
+        self.init_params = init_params
+
+        assert self.covariance_type in ["full", "diag"]
+        assert self.init_params in ["kmeans", "random"]
+
+        self._init_params()
+
+    def _init_params(self):
+        if self.mu_init is not None:
+            assert self.mu_init.size() == (1, self.n_components, self.n_features)
+            self.mu = torch.nn.Parameter(self.mu_init, requires_grad=False)
+        else:
+            self.mu = torch.nn.Parameter(torch.randn(1, self.n_components, self.n_features), requires_grad=False)
+
+        if self.covariance_type == "diag":
+            if self.var_init is not None:
+                assert self.var_init.size() == (1, self.n_components, self.n_features)
+                self.var = torch.nn.Parameter(self.var_init, requires_grad=False)
+            else:
+                self.var = torch.nn.Parameter(torch.ones(1, self.n_components, self.n_features), requires_grad=False)
+        elif self.covariance_type == "full":
+            if self.var_init is not None:
+                assert self.var_init.size() == (1, self.n_components, self.n_features, self.n_features)
+                self.var = torch.nn.Parameter(self.var_init, requires_grad=False)
+            else:
+                self.var = torch.nn.Parameter(
+                    torch.eye(self.n_features).reshape(1, 1, self.n_features, self.n_features).repeat(1,
+                                                                                                      self.n_components,
+                                                                                                      1, 1),
+                    requires_grad=False
+                )
+
+        self.pi = torch.nn.Parameter(torch.Tensor(1, self.n_components, 1), requires_grad=False).fill_(
+            1. / self.n_components)
+        self.params_fitted = False
+
+    def check_size(self, x):
+        if len(x.size()) == 2:
+            x = x.unsqueeze(1)
+        return x
+
+    def fit(self, x, delta=1e-3, n_iter=100, warm_start=False):
+        """Fits model to the data."""
+        if not warm_start and self.params_fitted:
+            self._init_params()
+
+        x = self.check_size(x)
+
+        if self.init_params == "kmeans" and self.mu_init is None:
+            mu = self.get_kmeans_mu(x, n_centers=self.n_components)
+            self.mu.data = mu
+
+        for p in self.parameters():
+            p.data = p.data.to(x.device)
+
+        i = 0
+        j = np.inf
+
+        while (i <= n_iter) and (j >= delta):
+            log_likelihood_old = self.log_likelihood
+            mu_old = self.mu
+            var_old = self.var
+
+            self.__em(x)
+            self.log_likelihood = self.__score(x)
+
+            if torch.isinf(self.log_likelihood.abs()) or torch.isnan(self.log_likelihood):
+                device = self.mu.device
+                self.__init__(self.n_components, self.n_features, covariance_type=self.covariance_type,
+                              mu_init=self.mu_init, var_init=self.var_init, eps=self.eps)
+                for p in self.parameters():
+                    p.data = p.data.to(device)
+                if self.init_params == "kmeans":
+                    self.mu.data = self.get_kmeans_mu(x, n_centers=self.n_components)[0]
+
+            i += 1
+            j = self.log_likelihood - log_likelihood_old
+            j = np.inf if math.isnan(j) else j
+
+            if j <= delta:
+                self.__update_mu(mu_old)
+                self.__update_var(var_old)
+
+        self.params_fitted = True
+
+    def predict(self, x, probs=False):
+        """Assigns input data to mixture components."""
+        x = self.check_size(x)
+        weighted_log_prob = self._estimate_log_prob(x) + torch.log(self.pi)
+
+        if probs:
+            p_k = torch.exp(weighted_log_prob)
+            return torch.squeeze(p_k / (p_k.sum(1, keepdim=True)))
+        else:
+            return torch.squeeze(torch.max(weighted_log_prob, 1)[1].type(torch.LongTensor))
+
+    def predict_proba(self, x):
+        """Returns normalized probabilities of class membership."""
+        return self.predict(x, probs=True)
+
+    def sample(self, n):
+        """Samples from the model."""
+        counts = torch.distributions.multinomial.Multinomial(total_count=n, probs=self.pi.squeeze()).sample()
+        x = torch.empty(0, device=counts.device)
+        y = torch.cat([torch.full([int(sample)], j, device=counts.device) for j, sample in enumerate(counts)])
+
+        for k in torch.arange(self.n_components, device=counts.device)[counts > 0]:
+            if self.covariance_type == "diag":
+                x_k = self.mu[0, k] + torch.randn(int(counts[k]), self.n_features, device=x.device) * torch.sqrt(
+                    self.var[0, k])
+            elif self.covariance_type == "full":
+                d_k = torch.distributions.multivariate_normal.MultivariateNormal(self.mu[0, k], self.var[0, k])
+                x_k = torch.stack([d_k.sample() for _ in range(int(counts[k]))])
+
+            x = torch.cat((x, x_k), dim=0)
+
+        return x, y
+
+    def score_samples(self, x):
+        """Computes log-likelihood of samples under the current model."""
+        x = self.check_size(x)
+        score = self.__score(x, as_average=False)
+        return score
+
+    def _estimate_log_prob(self, x):
+        """Returns log-likelihood that samples belong to the k-th Gaussian."""
+        x = self.check_size(x)
+
+        if self.covariance_type == "full":
+            mu = self.mu
+            var = self.var
+            precision = torch.inverse(var)
+            d = x.shape[-1]
+
+            log_2pi = d * np.log(2. * pi)
+            log_det = self._calculate_log_det(precision)
+
+            x_mu_T = (x - mu).unsqueeze(-2)
+            x_mu = (x - mu).unsqueeze(-1)
+
+            x_mu_T_precision = calculate_matmul_n_times(self.n_components, x_mu_T, precision)
+            x_mu_T_precision_x_mu = calculate_matmul(x_mu_T_precision, x_mu)
+
+            return -.5 * (log_2pi - log_det + x_mu_T_precision_x_mu)
+
+        elif self.covariance_type == "diag":
+            mu = self.mu
+            prec = torch.rsqrt(self.var)
+
+            log_p = torch.sum((mu * mu + x * x - 2 * x * mu) * prec, dim=2, keepdim=True)
+            log_det = torch.sum(torch.log(prec), dim=2, keepdim=True)
+
+            return -.5 * (self.n_features * np.log(2. * pi) + log_p - log_det)
+
+    def _calculate_log_det(self, var):
+        """Calculate log determinant in log space."""
+        log_det = torch.empty(size=(self.n_components,)).to(var.device)
+
+        for k in range(self.n_components):
+            log_det[k] = 2 * torch.log(torch.diagonal(torch.linalg.cholesky(var[0, k]))).sum()
+
+        return log_det.unsqueeze(-1)
+
+    def _e_step(self, x):
+        """Expectation step of the EM algorithm."""
+        x = self.check_size(x)
+        weighted_log_prob = self._estimate_log_prob(x) + torch.log(self.pi)
+        log_prob_norm = torch.logsumexp(weighted_log_prob, dim=1, keepdim=True)
+        log_resp = weighted_log_prob - log_prob_norm
+        return torch.mean(log_prob_norm), log_resp
+
+    def _m_step(self, x, log_resp):
+        """Maximization step of the EM algorithm."""
+        x = self.check_size(x)
+        resp = torch.exp(log_resp)
+
+        pi = torch.sum(resp, dim=0, keepdim=True) + self.eps
+        mu = torch.sum(resp * x, dim=0, keepdim=True) / pi
+
+        if self.covariance_type == "full":
+            eps = (torch.eye(self.n_features) * self.eps).to(x.device)
+            var = torch.sum((x - mu).unsqueeze(-1).matmul((x - mu).unsqueeze(-2)) * resp.unsqueeze(-1), dim=0,
+                            keepdim=True) / torch.sum(resp, dim=0, keepdim=True).unsqueeze(-1) + eps
+        elif self.covariance_type == "diag":
+            x2 = (resp * x * x).sum(0, keepdim=True) / pi
+            mu2 = mu * mu
+            xmu = (resp * mu * x).sum(0, keepdim=True) / pi
+            var = x2 - 2 * xmu + mu2 + self.eps
+
+        pi = pi / x.shape[0]
+        return pi, mu, var
+
+    def __em(self, x):
+        """Performs one iteration of the expectation-maximization algorithm."""
+        _, log_resp = self._e_step(x)
+        pi, mu, var = self._m_step(x, log_resp)
+        self.__update_pi(pi)
+        self.__update_mu(mu)
+        self.__update_var(var)
+
+    def __score(self, x, as_average=True):
+        """Computes the log-likelihood of the data under the model."""
+        weighted_log_prob = self._estimate_log_prob(x) + torch.log(self.pi)
+        per_sample_score = torch.logsumexp(weighted_log_prob, dim=1)
+
+        if as_average:
+            return per_sample_score.mean()
+        else:
+            return torch.squeeze(per_sample_score)
+
+    def __update_mu(self, mu):
+        """Updates mean to the provided value."""
+        if mu.size() == (self.n_components, self.n_features):
+            self.mu = mu.unsqueeze(0)
+        elif mu.size() == (1, self.n_components, self.n_features):
+            self.mu.data = mu
+
+    def __update_var(self, var):
+        """Updates variance to the provided value."""
+        if self.covariance_type == "full":
+            if var.size() == (self.n_components, self.n_features, self.n_features):
+                self.var = var.unsqueeze(0)
+            elif var.size() == (1, self.n_components, self.n_features, self.n_features):
+                self.var.data = var
+        elif self.covariance_type == "diag":
+            if var.size() == (self.n_components, self.n_features):
+                self.var = var.unsqueeze(0)
+            elif var.size() == (1, self.n_components, self.n_features):
+                self.var.data = var
+
+    def __update_pi(self, pi):
+        """Updates pi to the provided value."""
+        self.pi.data = pi
+
+    def get_kmeans_mu(self, x, n_centers, init_times=50, min_delta=1e-3):
+        """Find an initial value for the mean using k-means algorithm."""
+        if len(x.size()) == 3:
+            x = x.squeeze(1)
+        x_min, x_max = x.min(), x.max()
+        x = (x - x_min) / (x_max - x_min)
+
+        min_cost = np.inf
+
+        for i in range(init_times):
+            center_idxs = torch.from_numpy(np.random.choice(np.arange(x.shape[0]), size=n_centers, replace=False)).to(
+                x.device)
+            tmp_center = x[center_idxs, ...]
+            l2_dis = torch.norm((x.unsqueeze(1).repeat(1, n_centers, 1) - tmp_center), p=2, dim=2)
+            l2_cls = torch.argmin(l2_dis, dim=1)
+
+            cost = 0
+            for c in range(n_centers):
+                cost += torch.norm(x[l2_cls == c] - tmp_center[c], p=2, dim=1).mean()
+
+            if cost < min_cost:
+                min_cost = cost
+                center = tmp_center
+
+        delta = np.inf
+
+        while delta > min_delta:
+            l2_dis = torch.norm((x.unsqueeze(1).repeat(1, n_centers, 1) - center), p=2, dim=2)
+            l2_cls = torch.argmin(l2_dis, dim=1)
+            center_old = center.clone()
+
+            for c in range(n_centers):
+                center[c] = x[l2_cls == c].mean(dim=0)
+
+            delta = torch.norm((center_old - center), dim=1).max()
+
+        return (center.unsqueeze(0) * (x_max - x_min) + x_min)

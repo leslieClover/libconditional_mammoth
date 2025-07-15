@@ -1,0 +1,99 @@
+dataset: &dataset cifar100
+init_cls_num: &init_cls_num 10
+inc_cls_num: &inc_cls_num 10
+total_cls_num: &total_cls_num 100
+task_num: &task_num 10
+image_size: &image_size 224
+
+
+epoch: 20
+val_per_epoch: 20
+
+batch_size: 32
+
+train_trfms:
+  - RandomResizedCrop:
+      size: *image_size
+  - RandomHorizontalFlip: {}
+  - ToTensor: {}
+  - Normalize:
+      mean: [0.485, 0.456, 0.406]
+      std: [0.229, 0.224, 0.225]
+
+test_trfms:
+  - Resize:
+      size: *image_size
+  - ToTensor: {}
+  - Normalize:
+      mean: [0.485, 0.456, 0.406]
+      std: [0.229, 0.224, 0.225]
+
+
+optimizer:
+  name: Adam
+  kwargs:
+    lr: 0.001
+    betas: [0.9, 0.999]
+    weight_decay: 0
+
+lr_scheduler:
+  name: CosineSchedule
+  kwargs:
+    K: 20
+
+backbone:
+  name: vit_pt_imnet
+  kwargs:
+    num_classes: *total_cls_num
+    pretrained: true
+    model_name: vit_base_patch16_224
+
+classifier:
+  name: STARPrompt
+  kwargs:
+    num_class: *total_cls_num
+    task_num: *task_num
+    init_cls_num: *init_cls_num
+    inc_cls_num: *inc_cls_num
+    feat_dim: 768
+
+    # CLIP settings
+    clip_backbone: 'ViT-L/14'
+
+    # First stage settings
+    first_stage_lr: 0.002
+    first_stage_epochs: 20
+    first_stage_optim: 'sgd'
+    first_stage_momentum: 0
+    first_stage_weight_decay: 0
+    lambda_ortho_first_stage: 10
+    virtual_bs_n: 1
+
+    # Second stage settings
+    prompt_mode: 'residual'  # or 'concat'
+    enable_confidence_modulation: true
+    prefix_tuning_prompt_len: 5
+    ortho_split_val: 0
+    lambda_ortho_second_stage: 10
+
+    # Generative replay settings
+    enable_gr: true # 调试先禁止
+    gr_model: 'mog'  # or 'gaussian'
+    gr_mog_n_components: 3
+    gr_mog_n_iters_first_stage: 100
+    gr_mog_n_iters_second_stage: 100
+    num_samples_gr: 50
+    batch_size_gr: 128
+    num_epochs_gr_first_stage: 10
+    num_epochs_gr_second_stage: 10
+    learning_rate_gr_first_stage: 0.05
+    learning_rate_gr_second_stage: 0.001
+    num_monte_carlo_gr_first_stage: 1
+    num_monte_carlo_gr_second_stage: 1
+
+    # Other settings
+    debug_mode: false
+    nowand: true
+    dataset: *dataset
+    seed: 1993
+    permute_classes: 1
