@@ -62,49 +62,49 @@ class Prompter(torch.nn.Module):
 
         #  这里还是具体要改一下。再看看。
 
-        dataset_mean = None
-        dataset_std = None
-        
-        # 方法1：从 args 中获取（如果 STARPrompt 能访问到完整 config）
-        if hasattr(args, 'test_trfms'):
-            for transform in args.test_trfms:
-                if 'Normalize' in transform:
-                    dataset_mean = transform['Normalize']['mean']
-                    dataset_std = transform['Normalize']['std']
-                    break
-        
-        # 方法2：如果方法1不可行，提供一个配置参数
-        elif hasattr(args, 'dataset_mean') and hasattr(args, 'dataset_std'):
-            dataset_mean = args.dataset_mean
-            dataset_std = args.dataset_std
-        
-        # 方法3：作为后备，使用现有的数据集检测逻辑
-        else:
-            if hasattr(args, 'dataset'):
-                if 'cifar100' in args.dataset.lower():
-                    dataset_mean = [0.5071, 0.4867, 0.4408]
-                    dataset_std = [0.2675, 0.2565, 0.2761]
-
-                elif 'imagenet_r' in args.dataset.lower():
-                    dataset_mean = [0.0, 0.0, 0.0]
-                    dataset_std = [1.0, 1.0, 1.0]
-                else:
-                    # 直接就是 cub200
-                    dataset_mean = [0.485, 0.456, 0.406]
-                    dataset_std = [0.229, 0.224, 0.225]
-            else:
-                # 最终后备
-                dataset_mean = [0.485, 0.456, 0.406]
-                dataset_std = [0.229, 0.224, 0.225]
-
-        dataset_mean = torch.tensor(dataset_mean, device=device, dtype=torch.float32).view(1, 3, 1, 1)
-        dataset_std = torch.tensor(dataset_std, device=device, dtype=torch.float32).view(1, 3, 1, 1)
-        
-        self.denorm_transform = Denormalize(
-            mean=dataset_mean.squeeze().tolist(),
-            std=dataset_std.squeeze().tolist()
-        ).to(self.device)
-        logging.info(f"Initialized denormalization with mean={dataset_mean}, std={dataset_std}")
+        # dataset_mean = None
+        # dataset_std = None
+        #
+        # # 方法1：从 args 中获取（如果 STARPrompt 能访问到完整 config）
+        # if hasattr(args, 'test_trfms'):
+        #     for transform in args.test_trfms:
+        #         if 'Normalize' in transform:
+        #             dataset_mean = transform['Normalize']['mean']
+        #             dataset_std = transform['Normalize']['std']
+        #             break
+        #
+        # # 方法2：如果方法1不可行，提供一个配置参数
+        # elif hasattr(args, 'dataset_mean') and hasattr(args, 'dataset_std'):
+        #     dataset_mean = args.dataset_mean
+        #     dataset_std = args.dataset_std
+        #
+        # # 方法3：作为后备，使用现有的数据集检测逻辑
+        # else:
+        #     if hasattr(args, 'dataset'):
+        #         if 'cifar100' in args.dataset.lower():
+        #             dataset_mean = [0.5071, 0.4867, 0.4408]
+        #             dataset_std = [0.2675, 0.2565, 0.2761]
+        #
+        #         elif 'imagenet_r' in args.dataset.lower():
+        #             dataset_mean = [0.0, 0.0, 0.0]
+        #             dataset_std = [1.0, 1.0, 1.0]
+        #         else:
+        #             # 直接就是 cub200
+        #             dataset_mean = [0.485, 0.456, 0.406]
+        #             dataset_std = [0.229, 0.224, 0.225]
+        #     else:
+        #         # 最终后备
+        #         dataset_mean = [0.485, 0.456, 0.406]
+        #         dataset_std = [0.229, 0.224, 0.225]
+        #
+        # dataset_mean = torch.tensor(dataset_mean, device=device, dtype=torch.float32).view(1, 3, 1, 1)
+        # dataset_std = torch.tensor(dataset_std, device=device, dtype=torch.float32).view(1, 3, 1, 1)
+        #
+        # self.denorm_transform = Denormalize(
+        #     mean=dataset_mean.squeeze().tolist(),
+        #     std=dataset_std.squeeze().tolist()
+        # ).to(self.device)
+        # logging.info(f"Initialized denormalization with mean={dataset_mean}, std={dataset_std}")
 
         # Freeze CLIP model
         for p in self.clip_model.parameters():
@@ -162,7 +162,7 @@ class Prompter(torch.nn.Module):
         """Compute the CLIP features for the input image"""
         if not disable_renorm:
             # Apply CLIP normalization if needed
-            x = self.denorm_transform(x)
+            # x = self.denorm_transform(x)
             x = self.clip_normalization(x)
         clip_out = self.clip_model.encode_image(x)
         return clip_out
