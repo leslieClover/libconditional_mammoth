@@ -111,6 +111,7 @@ class Prompter(torch.nn.Module):
 
     def get_offsets(self, task_id):
         """Get class offsets for a given task"""
+        # 这里的函数有没有？
         if task_id == 0:
             return 0, self.args.init_cls_num if hasattr(self.args, 'init_cls_num') else 10
         else:
@@ -149,6 +150,7 @@ class Prompter(torch.nn.Module):
                 pbar.set_postfix({'loss': loss.item()}, refresh=False)
 
                 if not self.args.nowand and wandb is not None:
+                    assert wandb is not None, "wandb is not installed."
                     wandb.log({'ca_loss_first_stage': loss.item(), 'ca_lr_first_stage': optim.param_groups[0]['lr']})
 
     def align(self, current_task: int):
@@ -295,6 +297,7 @@ class FirstStageModel(torch.nn.Module):
 
     def train_first_stage_on_task(self, dataset, current_task: int, n_past_classes: int, n_seen_classes: int, loss_fn):
         """Train the first stage on current task"""
+        # 这个代码也在原来的mammoth-master中 没有。
         logging.info(f"Starting training of first stage on task: {current_task}")
 
         # Setup training

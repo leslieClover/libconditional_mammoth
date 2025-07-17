@@ -88,8 +88,8 @@ class SecondStageModel(nn.Module):
         self.prompter = Prompter(
             args,
             num_classes=num_classes,
-            target_embed_len=196,  # 14*14 patches for 224x224 image with 16x16 patches
-            target_embed_dim=vit_embed_dim,  # Use ViT embedding dimension for prompts
+            target_embed_len=self.vit.patch_embed.num_patches,  # 14*14 patches for 224x224 image with 16x16 patches
+            target_embed_dim=self.vit.embed_dim,  # Use ViT embedding dimension for prompts
             prompt_layers=self.prompt_layers,
             clip_model=clip_model,
             clip_preprocess=clip_preprocess,
@@ -97,17 +97,12 @@ class SecondStageModel(nn.Module):
         )
 
         # ⭐ 关键修复: 冻结ViT backbone，只保持分类头可训练
-        # 这个策略防止在新任务上过度拟合，保护已学习的特征表示
         for n, p in self.vit.named_parameters():
             if n != 'head.weight' and n != 'head.bias':
                 p.requires_grad = False  # 冻结除了分类头之外的所有参数
             else:
                 p.requires_grad = True   # 只有分类头可训练
 
-        # 确保prompter参数保持可训练状态
-        # prompter是StarPrompt的核心创新，需要持续学习
-        for n, p in self.prompter.named_parameters():
-            p.requires_grad = True
 
     def train(self, mode=True):
         super().train(False)
@@ -124,13 +119,16 @@ class SecondStageModel(nn.Module):
         clip_query = self.prompter.get_query(query_x, disable_renorm=not enable_renorm)
         # Ensure clip_query is in float32
         clip_query = clip_query.float()
+
+        features = self.vit.forward_features(x, first_stage_query=clip_query, prompter=self.prompter, cur_classes=cur_classes, frozen_past_classes=frozen_past_classes)
         
         if return_features:
-            features = self.vit.forward_features(x, first_stage_query=clip_query, prompter=self.prompter, cur_classes=cur_classes, frozen_past_classes=frozen_past_classes)
             return features
 
-        out = self.vit.forward(x, first_stage_query=clip_query, prompter=self.prompter, cur_classes=cur_classes, frozen_past_classes=frozen_past_classes)
+        # out = self.vit.forward(x, first_stage_query=clip_query, prompter=self.prompter, cur_classes=cur_classes, frozen_past_classes=frozen_past_classes)
+        out = self.vit.forward_head(features)
         
         if return_query:
             return out, clip_query
         return out
+    

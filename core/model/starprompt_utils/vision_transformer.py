@@ -9,6 +9,62 @@ import torch.nn.functional as F
 from functools import partial
 import math
 
+class Attention(nn.Module):
+    """
+    Attention layer as used in Vision Transformer.
+
+    Args:
+        dim: Number of input channels
+        num_heads: Number of attention heads
+        qkv_bias: If True, add a learnable bias to q, k, v
+        attn_drop: Dropout rate for attention weights
+        proj_drop: Dropout rate after the final projection
+    """
+
+    def __init__(self, dim, num_heads=8, qkv_bias=False, attn_drop=0., proj_drop=0.):
+        super().__init__()
+        assert dim % num_heads == 0, 'dim should be divisible by num_heads'
+        self.num_heads = num_heads
+        head_dim = dim // num_heads
+        self.scale = head_dim ** -0.5
+
+        self.qkv = nn.Linear(dim, dim * 3, bias=qkv_bias)
+        self.attn_drop = nn.Dropout(attn_drop)
+        self.proj = nn.Linear(dim, dim)
+        self.proj_drop = nn.Dropout(proj_drop)
+
+    def forward(self, x, **kwargs):
+        """
+        Forward pass of the attention layer.
+
+        Args:
+            x: Input tensor
+        """
+
+        B, N, C = x.shape
+
+        qkv = self.qkv(x)
+        qkv = qkv.reshape(B, N, 3, self.num_heads, C // self.num_heads).permute(2, 0, 3, 1, 4)
+        q, k, v = qkv.unbind(0)  # make torchscript happy (cannot use tensor as tuple)
+
+        # NOTE: flash attention is less debuggable than the original. Use the commented code below if in trouble.
+        # check torch version
+        if torch.__version__ >= '2.1.0':
+            x = F.scaled_dot_product_attention(q, k, v, scale=self.scale, dropout_p=self.attn_drop.p)
+        else:
+            warn_once("Torch verison < 2.1.0 detected. Using the original attention code.")
+            attn = (q @ k.transpose(-2, -1)) * self.scale
+            attn = attn.softmax(dim=-1)
+            attn = self.attn_drop(attn)
+            x = (attn @ v)
+
+        x = x.transpose(1, 2).reshape(B, N, C)
+
+        x = self.proj(x)
+        x = self.proj_drop(x)
+
+        return x
+
 
 class PatchEmbed(nn.Module):
     """2D Image to Patch Embedding"""
@@ -36,21 +92,21 @@ class PatchEmbed(nn.Module):
         return x
 
 
-class ResidualPromptAttention(nn.Module):
+class ResidualPromptAttention(Attention):
     """Multi-head attention with residual prompt support"""
-    def __init__(self, dim, num_heads=8, qkv_bias=False, attn_drop=0., proj_drop=0.):
-        super().__init__()
-        assert dim % num_heads == 0, 'dim should be divisible by num_heads'
-        self.num_heads = num_heads
-        head_dim = dim // num_heads
-        self.scale = head_dim ** -0.5
+    # def __init__(self, dim, num_heads=8, qkv_bias=False, attn_drop=0., proj_drop=0.):
+    #     super().__init__()
+    #     assert dim % num_heads == 0, 'dim should be divisible by num_heads'
+    #     self.num_heads = num_heads
+    #     head_dim = dim // num_heads
+    #     self.scale = head_dim ** -0.5
 
-        self.qkv = nn.Linear(dim, dim * 3, bias=qkv_bias)
-        self.attn_drop = nn.Dropout(attn_drop)
-        self.proj = nn.Linear(dim, dim)
-        self.proj_drop = nn.Dropout(proj_drop)
+    #     self.qkv = nn.Linear(dim, dim * 3, bias=qkv_bias)
+    #     self.attn_drop = nn.Dropout(attn_drop)
+    #     self.proj = nn.Linear(dim, dim)
+    #     self.proj_drop = nn.Dropout(proj_drop)
 
-    def forward(self, x, prompts=None):
+    def forward(self, x, prompts=None, **kwargs):
         B, N, C = x.shape
         qkv = self.qkv(x).reshape(B, N, 3, self.num_heads, C // self.num_heads).permute(2, 0, 3, 1, 4)
         q, k, v = qkv.unbind(0)
@@ -59,8 +115,8 @@ class ResidualPromptAttention(nn.Module):
             prompts = prompts.reshape(B, -1, self.num_heads, C // self.num_heads).permute(0, 2, 1, 3)
             v = v + prompts
 
-        if hasattr(F, 'scaled_dot_product_attention') and torch.__version__ >= '2.1.0':
-            x = F.scaled_dot_product_attention(q, k, v, scale=self.scale, dropout_p=self.attn_drop.p if self.training else 0.)
+        if torch.__version__ >= '2.1.0':
+            x = F.scaled_dot_product_attention(q, k, v, scale=self.scale, dropout_p=self.attn_drop.p)
         else:
             attn = (q @ k.transpose(-2, -1)) * self.scale
             attn = attn.softmax(dim=-1)
@@ -73,21 +129,21 @@ class ResidualPromptAttention(nn.Module):
         return x
 
 
-class PrefixTuningAttention(nn.Module):
+class PrefixTuningAttention(Attention):
     """Multi-head attention with prefix tuning support"""
-    def __init__(self, dim, num_heads=8, qkv_bias=False, attn_drop=0., proj_drop=0.):
-        super().__init__()
-        assert dim % num_heads == 0, 'dim should be divisible by num_heads'
-        self.num_heads = num_heads
-        head_dim = dim // num_heads
-        self.scale = head_dim ** -0.5
+    # def __init__(self, dim, num_heads=8, qkv_bias=False, attn_drop=0., proj_drop=0.):
+    #     super().__init__()
+    #     assert dim % num_heads == 0, 'dim should be divisible by num_heads'
+    #     self.num_heads = num_heads
+    #     head_dim = dim // num_heads
+    #     self.scale = head_dim ** -0.5
 
-        self.qkv = nn.Linear(dim, dim * 3, bias=qkv_bias)
-        self.attn_drop = nn.Dropout(attn_drop)
-        self.proj = nn.Linear(dim, dim)
-        self.proj_drop = nn.Dropout(proj_drop)
+    #     self.qkv = nn.Linear(dim, dim * 3, bias=qkv_bias)
+    #     self.attn_drop = nn.Dropout(attn_drop)
+    #     self.proj = nn.Linear(dim, dim)
+    #     self.proj_drop = nn.Dropout(proj_drop)
 
-    def forward(self, x, prompts=None):
+    def forward(self, x, prompts=None, **kwargs):
         B, N, C = x.shape
         qkv = self.qkv(x).reshape(B, N, 3, self.num_heads, C // self.num_heads).permute(2, 0, 3, 1, 4)
         q, k, v = qkv.unbind(0)
@@ -101,8 +157,8 @@ class PrefixTuningAttention(nn.Module):
             k = torch.cat([prompt_k, k], dim=2)
             v = torch.cat([prompt_v, v], dim=2)
 
-        if hasattr(F, 'scaled_dot_product_attention') and torch.__version__ >= '2.1.0':
-            x = F.scaled_dot_product_attention(q, k, v, scale=self.scale, dropout_p=self.attn_drop.p if self.training else 0.)
+        if torch.__version__ >= '2.1.0':
+            x = F.scaled_dot_product_attention(q, k, v, scale=self.scale, dropout_p=self.attn_drop.p)
         else:
             attn = (q @ k.transpose(-2, -1)) * self.scale
             attn = attn.softmax(dim=-1)
@@ -164,10 +220,20 @@ class DropPath(nn.Module):
 
 class Block(nn.Module):
     """Transformer block with prompt support"""
-    def __init__(self, dim, num_heads, mlp_ratio=4., qkv_bias=False, drop=0., attn_drop=0.,
-                 drop_path=0., init_values=None, act_layer=nn.GELU, norm_layer=nn.LayerNorm, 
+    def __init__(self, 
+                 dim, 
+                 num_heads, 
+                 mlp_ratio=4.,
+                 qkv_bias=False, 
+                 drop=0., 
+                 attn_drop=0.,
+                 drop_path=0., 
+                 init_values=None, 
+                 act_layer=nn.GELU, 
+                 norm_layer=nn.LayerNorm, 
                  attn_layer=ResidualPromptAttention):
         super().__init__()
+        self.embed_dim = dim
         self.norm1 = norm_layer(dim)
         self.attn = attn_layer(dim, num_heads=num_heads, qkv_bias=qkv_bias, attn_drop=attn_drop, proj_drop=drop)
         self.ls1 = LayerScale(dim, init_values=init_values) if init_values else nn.Identity()
@@ -188,10 +254,25 @@ class Block(nn.Module):
 class VisionTransformer(nn.Module):
     """Vision Transformer with prompt integration for STAR-Prompt"""
 
-    def __init__(self, img_size=224, patch_size=16, in_chans=3, num_classes=1000, embed_dim=768, depth=12,
-                 num_heads=12, mlp_ratio=4., qkv_bias=True, init_values=None, drop_rate=0., attn_drop_rate=0.,
-                 drop_path_rate=0., norm_layer=None, act_layer=None, prompt_mode='residual', 
-                 clip_embed_dim=512, **kwargs):
+    def __init__(self, 
+                 img_size=224, 
+                 patch_size=16, 
+                 in_chans=3, 
+                 num_classes=1000, 
+                 embed_dim=768, 
+                 depth=12,
+                 num_heads=12, 
+                 mlp_ratio=4., 
+                 qkv_bias=True, 
+                 init_values=None, 
+                 drop_rate=0., 
+                 attn_drop_rate=0.,
+                 drop_path_rate=0., 
+                 norm_layer=None, 
+                 act_layer=None, 
+                 prompt_mode='residual', 
+                 clip_embed_dim=512, 
+                 **kwargs):
         super().__init__()
         
         self.num_classes = num_classes

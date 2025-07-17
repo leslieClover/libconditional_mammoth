@@ -9,6 +9,7 @@ import torch
 import torch.nn as nn
 from typing import List
 from kornia.augmentation import Normalize
+from kornia.enhance import Denormalize 
 
 try:
     import clip
@@ -58,24 +59,75 @@ class Prompter(torch.nn.Module):
             self.clip_preprocess.transforms[-1].std
         ).to(self.device)
 
+
+        #  这里还是具体要改一下。再看看。
+
+        dataset_mean = None
+        dataset_std = None
+        
+        # 方法1：从 args 中获取（如果 STARPrompt 能访问到完整 config）
+        if hasattr(args, 'test_trfms'):
+            for transform in args.test_trfms:
+                if 'Normalize' in transform:
+                    dataset_mean = transform['Normalize']['mean']
+                    dataset_std = transform['Normalize']['std']
+                    break
+        
+        # 方法2：如果方法1不可行，提供一个配置参数
+        elif hasattr(args, 'dataset_mean') and hasattr(args, 'dataset_std'):
+            dataset_mean = args.dataset_mean
+            dataset_std = args.dataset_std
+        
+        # 方法3：作为后备，使用现有的数据集检测逻辑
+        else:
+            if hasattr(args, 'dataset'):
+                if 'cifar100' in args.dataset.lower():
+                    dataset_mean = [0.5071, 0.4867, 0.4408]
+                    dataset_std = [0.2675, 0.2565, 0.2761]
+
+                elif 'imagenet_r' in args.dataset.lower():
+                    dataset_mean = [0.0, 0.0, 0.0]
+                    dataset_std = [1.0, 1.0, 1.0]
+                else:
+                    # 直接就是 cub200
+                    dataset_mean = [0.485, 0.456, 0.406]
+                    dataset_std = [0.229, 0.224, 0.225]
+            else:
+                # 最终后备
+                dataset_mean = [0.485, 0.456, 0.406]
+                dataset_std = [0.229, 0.224, 0.225]
+
+        dataset_mean = torch.tensor(dataset_mean, device=device, dtype=torch.float32).view(1, 3, 1, 1)
+        dataset_std = torch.tensor(dataset_std, device=device, dtype=torch.float32).view(1, 3, 1, 1)
+        
+        self.denorm_transform = Denormalize(
+            mean=dataset_mean.squeeze().tolist(),
+            std=dataset_std.squeeze().tolist()
+        ).to(self.device)
+        logging.info(f"Initialized denormalization with mean={dataset_mean}, std={dataset_std}")
+
         # Freeze CLIP model
         for p in self.clip_model.parameters():
             p.requires_grad = False
-
-
 
         # Initialize prompt parameters for each layer
         logging.info(f"Initializing prompts with target_embed_dim: {self.target_embed_dim}, clip_embed_dim: {self.clip_embed_dim}")
         
         for l in self.prompt_layers:
             if args.prompt_mode == 'residual':
-                # Residual prompting - create prompts with ViT dimension
-                tmp = self.get_parameter((self.num_classes, self.target_embed_dim))
+                # NOTE: this initialization follows that of CODA-Prompt.
+                # We originally initialize a prompt for key, query, and value of the MHA layer.
+                tmp = self.get_parameter((self.num_classes, 3, self.target_embed_dim))
+                # We only use value at the end, so we keep only a single tensor.
+                tmp.data = tmp.data[:, 0]
+                # HOWEVER: Since the orthogonal_ of pytorch flattens the tensor, the value prompt is not orthogonal anymore.
+                # orthogonal_ made (C, 3, D) -> (C, 3*D) -> orthogonal -> (C, 3, D), thus each 3*D is orthogonal, but not each D.
+                # This is intended and makes the orthogonalization loss being optimized at the beginning.
                 setattr(self, f'p_{l}', tmp)
                 if l == 0:  # Only log for first layer
-                    logging.info(f"Layer {l}: Created residual prompt with shape {tmp.shape}")
+                    logging.info(f"Layer {l}: Created CODA-style residual prompt with shape {tmp.shape} (originally 3D)")
             else:
-                # Prefix tuning prompting
+                # Prefix tuning prompting - keep original implementation
                 prompt_param = self.get_parameter((
                     self.num_classes,
                     2 * self.args.prefix_tuning_prompt_len,
@@ -85,7 +137,7 @@ class Prompter(torch.nn.Module):
                 if l == 0:  # Only log for first layer
                     logging.info(f"Layer {l}: Created concat prompt with shape {prompt_param.shape}")
 
-            # Attention weights for each class - use CLIP embedding dimension
+            # Attention weights for each class - 保持原有实现
             attn_param = self.get_parameter((self.num_classes, self.clip_embed_dim))
             setattr(self, f'a_{l}', attn_param)
             if l == 0:  # Only log for first layer
@@ -110,6 +162,7 @@ class Prompter(torch.nn.Module):
         """Compute the CLIP features for the input image"""
         if not disable_renorm:
             # Apply CLIP normalization if needed
+            x = self.denorm_transform(x)
             x = self.clip_normalization(x)
         clip_out = self.clip_model.encode_image(x)
         return clip_out
@@ -158,11 +211,11 @@ class Prompter(torch.nn.Module):
             if self.prompt_mode == 'residual':
                 pv: torch.Tensor = getattr(self, f'p_{layer_idx}')
                 # Debug: log shapes only for first layer and first call
-                if layer_idx == 0 and hasattr(self, '_debug_logged') is False:
-                    logging.info(f"Debug - Layer {layer_idx}: clip_query shape: {clip_query.shape}")
-                    logging.info(f"Debug - Layer {layer_idx}: attention weights shape: {a.shape}")
-                    logging.info(f"Debug - Layer {layer_idx}: prompt params shape: {pv.shape}")
-                    self._debug_logged = True
+                # if layer_idx == 0 and hasattr(self, '_debug_logged') is False:
+                #     logging.info(f"Debug - Layer {layer_idx}: clip_query shape: {clip_query.shape}")
+                #     logging.info(f"Debug - Layer {layer_idx}: attention weights shape: {a.shape}")
+                #     logging.info(f"Debug - Layer {layer_idx}: prompt params shape: {pv.shape}")
+                #     self._debug_logged = True
             else:
                 p_concat: torch.Tensor = getattr(self, f'p_concat_{layer_idx}')
                 p_concat_k, p_concat_v = torch.split(p_concat, self.args.prefix_tuning_prompt_len, dim=1)
@@ -222,7 +275,7 @@ class Prompter(torch.nn.Module):
             past_pv = p[:frozen_past_classes].detach()
             cur_pv = p[frozen_past_classes:cur_classes]
 
-            # Flatten if necessary for proper matrix multiplication
+            # Flatten if necessary for proper matrix multiplication, 在这里做的修复,避免了潜在的 device 不匹配错误
             if cur_pv.dim() > 2:
                 cur_pv_flat = cur_pv.view(cur_pv.shape[0], -1)
                 past_pv_flat = past_pv.view(past_pv.shape[0], -1)
