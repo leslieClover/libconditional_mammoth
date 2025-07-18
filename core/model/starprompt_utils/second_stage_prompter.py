@@ -9,12 +9,55 @@ import torch
 import torch.nn as nn
 from typing import List
 from kornia.augmentation import Normalize
-from kornia.enhance import Denormalize 
+# from kornia.enhance import Denormalize 
 
 try:
     import clip
 except ImportError:
     raise ImportError("Please install the CLIP package by running: pip install git+https://github.com/openai/CLIP.git")
+
+
+class DeNormalize(object):
+    def __init__(self, mean, std):
+        """
+        完全复制 Mammoth 的 DeNormalize 实现
+        """
+        if isinstance(mean, (list, tuple)):
+            mean = torch.tensor(mean)
+        elif isinstance(mean, torch.Tensor):
+            mean = mean.clone()
+        
+        if isinstance(std, (list, tuple)):
+            std = torch.tensor(std)
+        elif isinstance(std, torch.Tensor):
+            std = std.clone()
+
+        self.mean = mean
+        self.std = std
+
+    def __call__(self, tensor):
+        """
+        与 Mammoth 完全一致的反归一化实现
+        """
+        if tensor.ndimension() == 3:
+            tensor = tensor.unsqueeze(0)
+
+        # 确保设备一致性
+        if tensor.device != self.mean.device:
+            self.mean = self.mean.to(tensor.device)
+            self.std = self.std.to(tensor.device)
+
+        # 关键：使用正确的广播形状
+        mean = self.mean.view(1, -1, 1, 1) if self.mean.dim() == 1 else self.mean[:, None, None]
+        std = self.std.view(1, -1, 1, 1) if self.std.dim() == 1 else self.std[:, None, None]
+        
+        return (tensor * std) + mean
+
+    def to(self, device):
+        """设备转移方法"""
+        self.mean = self.mean.to(device)
+        self.std = self.std.to(device)
+        return self
 
 
 class Prompter(torch.nn.Module):
@@ -60,51 +103,46 @@ class Prompter(torch.nn.Module):
         ).to(self.device)
 
 
-        #  这里还是具体要改一下。再看看。
+        if hasattr(args, 'train_trfms') and args.train_trfms:
+            # 从训练变换中找到 Normalize 配置
+            normalize_config = None
+            for transform in args.train_trfms:
+                if 'Normalize' in transform:
+                    normalize_config = transform['Normalize']
+                    break
+            
+            if normalize_config:
+                mean_values = normalize_config['mean']
+                std_values = normalize_config['std']
+            else:
+                # 如果没找到，使用 CIFAR100 默认值
+                mean_values = [0.5071, 0.4867, 0.4408]
+                std_values = [0.2675, 0.2565, 0.2761]
+        
+        # 方案2: 如果 args 中直接有数据集特定的配置
+        elif hasattr(args, 'dataset_mean') and hasattr(args, 'dataset_std'):
+            mean_values = args.dataset_mean
+            std_values = args.dataset_std
+        
+        # 方案3: 根据数据集名称选择对应的参数
+        elif hasattr(args, 'dataset'):
+            dataset_name = args.dataset.lower()
+            if 'cifar100' in dataset_name:
+                mean_values = [0.5071, 0.4867, 0.4408]
+                std_values = [0.2675, 0.2565, 0.2761]
+            elif 'imagenet' in dataset_name:
+                mean_values = [0.485, 0.456, 0.406]
+                std_values = [0.229, 0.224, 0.225]
+            else:
+                # 默认使用 YAML 中配置的 ImageNet 参数
+                mean_values = [0.485, 0.456, 0.406]
+                std_values = [0.229, 0.224, 0.225]
+        else:
+            # 最终默认值：使用 YAML 中的 ImageNet 参数
+            mean_values = [0.485, 0.456, 0.406]
+            std_values = [0.229, 0.224, 0.225]
 
-        # dataset_mean = None
-        # dataset_std = None
-        #
-        # # 方法1：从 args 中获取（如果 STARPrompt 能访问到完整 config）
-        # if hasattr(args, 'test_trfms'):
-        #     for transform in args.test_trfms:
-        #         if 'Normalize' in transform:
-        #             dataset_mean = transform['Normalize']['mean']
-        #             dataset_std = transform['Normalize']['std']
-        #             break
-        #
-        # # 方法2：如果方法1不可行，提供一个配置参数
-        # elif hasattr(args, 'dataset_mean') and hasattr(args, 'dataset_std'):
-        #     dataset_mean = args.dataset_mean
-        #     dataset_std = args.dataset_std
-        #
-        # # 方法3：作为后备，使用现有的数据集检测逻辑
-        # else:
-        #     if hasattr(args, 'dataset'):
-        #         if 'cifar100' in args.dataset.lower():
-        #             dataset_mean = [0.5071, 0.4867, 0.4408]
-        #             dataset_std = [0.2675, 0.2565, 0.2761]
-        #
-        #         elif 'imagenet_r' in args.dataset.lower():
-        #             dataset_mean = [0.0, 0.0, 0.0]
-        #             dataset_std = [1.0, 1.0, 1.0]
-        #         else:
-        #             # 直接就是 cub200
-        #             dataset_mean = [0.485, 0.456, 0.406]
-        #             dataset_std = [0.229, 0.224, 0.225]
-        #     else:
-        #         # 最终后备
-        #         dataset_mean = [0.485, 0.456, 0.406]
-        #         dataset_std = [0.229, 0.224, 0.225]
-        #
-        # dataset_mean = torch.tensor(dataset_mean, device=device, dtype=torch.float32).view(1, 3, 1, 1)
-        # dataset_std = torch.tensor(dataset_std, device=device, dtype=torch.float32).view(1, 3, 1, 1)
-        #
-        # self.denorm_transform = Denormalize(
-        #     mean=dataset_mean.squeeze().tolist(),
-        #     std=dataset_std.squeeze().tolist()
-        # ).to(self.device)
-        # logging.info(f"Initialized denormalization with mean={dataset_mean}, std={dataset_std}")
+        self.denorm_transform = DeNormalize(mean=mean_values, std=std_values).to(device)
 
         # Freeze CLIP model
         for p in self.clip_model.parameters():
@@ -162,7 +200,7 @@ class Prompter(torch.nn.Module):
         """Compute the CLIP features for the input image"""
         if not disable_renorm:
             # Apply CLIP normalization if needed
-            # x = self.denorm_transform(x)
+            x = self.denorm_transform(x)
             x = self.clip_normalization(x)
         clip_out = self.clip_model.encode_image(x)
         return clip_out
