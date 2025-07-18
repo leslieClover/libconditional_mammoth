@@ -40,49 +40,48 @@ class SecondStageModel(nn.Module):
         else:
             clip_embed_dim = clip_model.visual.output_dim
 
-        # Determine ViT architecture based on CLIP backbone
-        if hasattr(args, 'clip_backbone'):
-            if 'ViT-L/14' in args.clip_backbone:
-                vit_embed_dim = 1024
-                vit_depth = 24
-                vit_num_heads = 16
-            elif 'ViT-B/16' in args.clip_backbone:
-                vit_embed_dim = 768
-                vit_depth = 12
-                vit_num_heads = 12
-            else:  # ViT-B/32 or other
-                vit_embed_dim = 768
-                vit_depth = 12
-                vit_num_heads = 12
-        else:
-            # Default ViT-B configuration
-            vit_embed_dim = 768
-            vit_depth = 12
-            vit_num_heads = 12
+
 
         # Initialize Vision Transformer
-        self.vit = VisionTransformer(
-            img_size=224,
-            patch_size=16,
-            in_chans=3,
+        # vit_model = VisionTransformer(
+        #     img_size=224,
+        #     patch_size=16,
+        #     in_chans=3,
+        #     num_classes=num_classes,
+        #     embed_dim=768,
+        #     depth=12,
+        #     num_heads=12,
+        #     mlp_ratio=4.,
+        #     qkv_bias=True,
+        #     drop_rate=0.1,
+        #     attn_drop_rate=0.1,
+        #     drop_path_rate=0.0,
+        #     prompt_mode=args.prompt_mode,
+        #     clip_embed_dim=clip_embed_dim
+        # ).to(device)
+        vit_model = VisionTransformer(
+            embed_dim=768,
+            depth=12,
+            num_heads=12,
+            drop_path_rate=0,
             num_classes=num_classes,
-            embed_dim=vit_embed_dim,
-            depth=vit_depth,
-            num_heads=vit_num_heads,
-            mlp_ratio=4.,
-            qkv_bias=True,
-            drop_rate=0.1,
-            attn_drop_rate=0.1,
-            drop_path_rate=0.1,
-            prompt_mode=args.prompt_mode,
-            clip_embed_dim=clip_embed_dim
+            prompt_mode=args.prompt_mod
         ).to(device)
 
-        logging.info(f"Using Vision Transformer with embed_dim: {vit_embed_dim}, depth: {vit_depth}, heads: {vit_num_heads}")
-        logging.info(f"CLIP embedding dim: {clip_embed_dim}")
+        # logging.info("Loading the Vision Transformer backbone...")
+        # load_dict = backbone.state_dict()
+        # for k in list(load_dict.keys()):
+        #     if 'head' in k:
+        #         del load_dict[k]
+        # missing, unexpected = vit_model.load_state_dict(load_dict, strict=False)
+        # assert len([m for m in missing if 'head' not in m]) == 0, f"Missing keys: {missing}"
+        # assert len(unexpected) == 0, f"Unexpected keys: {unexpected}"
+
+        self.vit = vit_model
 
         # Set up prompt layers - use the actual depth of the ViT
-        self.prompt_layers = list(range(vit_depth))
+        # self.prompt_layers = list(range(vit_depth))
+        self.prompt_layers = list(range(len(self.vit.blocks)))
 
         logging.info("Initializing the prompter and prompt parameters...")
         self.prompter = Prompter(
@@ -96,7 +95,6 @@ class SecondStageModel(nn.Module):
             device=device
         )
 
-        # ⭐ 关键修复: 冻结ViT backbone，只保持分类头可训练
         for n, p in self.vit.named_parameters():
             if n != 'head.weight' and n != 'head.bias':
                 p.requires_grad = False  # 冻结除了分类头之外的所有参数
