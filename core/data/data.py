@@ -1,6 +1,9 @@
 import numpy as np
 from torchvision import transforms
 
+# 这里有个问题是没有cub200的transform, 如果要跑的话，得自己加上去，
+
+
 class CIFARTransform:
     MEAN = [0.5071,  0.4866,  0.4409]
     STD = [0.2675, 0.2565, 0.2761]

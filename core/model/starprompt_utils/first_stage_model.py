@@ -298,7 +298,7 @@ class FirstStageModel(torch.nn.Module):
 
     def train_first_stage_on_task(self, dataset, current_task: int, n_past_classes: int, n_seen_classes: int, loss_fn):
         """Train the first stage on current task"""
-        # 这个代码也在原来的mammoth-master中 没有。
+      
         logging.info(f"Starting training of first stage on task: {current_task}")
 
         # Setup training

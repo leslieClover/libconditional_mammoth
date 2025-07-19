@@ -24,6 +24,8 @@ from .starprompt_utils.generative_replay import Gaussian, MixtureOfGaussiansMode
 from core.utils.utils import count_parameters
 from core.utils.conf import create_seeded_dataloader
 
+from core.data.data import CIFARTransform, ImageNetTransform, ImageNetRTransform, TinyImageNetTransform, FiveDatasetsTransform
+from core.data.dataset import ContinualDatasets, SingleDataset
 
 try:
     import wandb
@@ -36,6 +38,29 @@ try:
 except ImportError:
     raise ImportError("Please install the CLIP package by running: pip install git+https://github.com/openai/CLIP.git")
 
+
+class LibContinualDatasetAdapter:
+    """
+    适配器类，用于将LibContinual的ContinualDatasets适配到Mammoth的接口
+    """
+    def __init__(self, dataset: ContinualDatasets, current_task: int):
+        self.train_loader = dataset.get_loader(current_task)
+        
+        # 创建测试数据集
+        test_dataset = ContinualDatasets(
+            dataset.dataset, 'test', dataset.task_num, dataset.init_cls_num, 
+            dataset.inc_cls_num, dataset.data_root, dataset.cls_map, dataset.trfms, 
+            dataset.batchsize, dataset.num_workers, dataset.config
+        )
+        
+        # 获取所有已见任务的测试数据
+        self.test_loaders = []
+        for t in range(current_task + 1):
+            test_loader = test_dataset.get_loader(t)
+            if isinstance(test_loader, list):
+                self.test_loaders.extend(test_loader)
+            else:
+                self.test_loaders.append(test_loader)
 
 class STARPromptModel(nn.Module):
     """
@@ -249,6 +274,186 @@ class STARPromptModel(nn.Module):
         return self.first_stage.train_first_stage_on_task(dataset, current_task, n_past_classes, n_seen_classes,
                                                           loss_fn)
 
+    # @torch.enable_grad()
+    # def train_first_stage_on_task(self, dataset: ContinualDatasets, current_task: int, n_past_classes: int, n_seen_classes: int, loss_fn):
+    #     """
+    #     Train the first stage on the current task.
+    #     完全按照Mammoth版本适配LibContinual
+
+    #     Args:
+    #         dataset: LibContinual的ContinualDatasets对象
+    #         current_task: 当前任务索引
+    #         n_past_classes: 过去任务的类别数
+    #         n_seen_classes: 已见过的总类别数
+    #         loss_fn: 损失函数
+    #     """
+    #     logging.info(f"Starting training of first stage on task: {current_task}")
+        
+    #     # BEGIN-TASK - 适配LibContinual的数据加载器接口
+    #     train_loader = dataset.get_loader(current_task)  # 获取当前任务的训练数据
+    #     test_loaders = dataset.get_loader(current_task) if dataset.mode == 'test' else None  # 获取测试数据
+        
+    #     # 保存原始transform
+    #     old_train_transform = train_loader.dataset.trfms
+    #     old_test_transform = None
+    #     if test_loaders is not None:
+    #         if isinstance(test_loaders, list):
+    #             old_test_transform = test_loaders[-1].dataset.trfms
+    #         else:
+    #             old_test_transform = test_loaders.dataset.trfms
+
+    #     # 使用CLIP的预处理
+    #     train_loader.dataset.trfms = self.first_stage.prompter.clip_preprocess
+    #     if test_loaders is not None:
+    #         if isinstance(test_loaders, list):
+    #             test_loaders[-1].dataset.trfms = self.first_stage.prompter.clip_preprocess
+    #         else:
+    #             test_loaders.dataset.trfms = self.first_stage.prompter.clip_preprocess
+
+    #     convert_weights(self.first_stage.prompter.clip_model)  # 转换权重为float16以加速训练
+    #     self.first_stage.prompter.text_encoder.dtype = torch.float16
+    #     was_training = self.first_stage.training
+    #     self.first_stage.train()
+
+    #     first_stage_params = [v for k, v in self.first_stage.named_parameters() if 'prompt_parameters' in k]
+    #     if self.args.first_stage_optim == 'sgd':
+    #         opt = torch.optim.SGD(first_stage_params, lr=self.args.first_stage_lr, momentum=self.args.first_stage_momentum,
+    #                             weight_decay=self.args.first_stage_weight_decay)
+    #     else:
+    #         opt = torch.optim.Adam(first_stage_params, lr=self.args.first_stage_lr,
+    #                             weight_decay=self.args.first_stage_weight_decay)
+
+    #     # MINI TRAINING LOOP FOR CURRENT TASK
+    #     with tqdm(total=self.args.first_stage_epochs * len(train_loader), desc='First stage training') as pbar:
+    #         for epoch in range(self.args.first_stage_epochs):
+    #             for i, data in enumerate(train_loader):
+    #                 if self.args.debug_mode and i > 3:
+    #                     break
+                    
+    #                 # 适配LibContinual的数据格式 - 从字典中获取image和label
+    #                 inputs = data["image"].to(self.device)
+    #                 labels = data["label"].to(self.device, dtype=torch.long)
+    #                 loss = torch.tensor(0.).to(self.device)
+
+    #                 opt.zero_grad()
+    #                 # Check cur and past classes
+    #                 clip_logits = self.first_stage(inputs, frozen_past_classes=n_past_classes, cur_classes=n_seen_classes)
+
+    #                 # compute clip loss
+    #                 clip_logits[:, :n_past_classes] = -float('inf')
+    #                 loss_clip = loss_fn(clip_logits[:, :n_seen_classes], labels)
+
+    #                 loss += loss_clip
+
+    #                 loss_ortho_coop = self.first_stage.prompter.compute_ortho_loss(frozen_past_classes=n_past_classes, cur_classes=n_seen_classes)
+    #                 loss += self.args.lambda_ortho_first_stage * loss_ortho_coop
+
+    #                 if i == 0:
+    #                     opt.zero_grad()
+    #                 (loss / self.args.virtual_bs_n).backward()
+    #                 if (i > 0 or self.args.virtual_bs_n == 1) and i % self.args.virtual_bs_n == 0:
+    #                     opt.step()
+    #                     opt.zero_grad()
+
+    #                 if not self.args.nowand:
+    #                     assert wandb is not None, "wandb is not installed."
+    #                     wandb.log({'first_stage_loss': loss.item(),
+    #                             'first_stage_lr': opt.param_groups[0]['lr'],
+    #                             'first_stage_epoch': epoch,
+    #                             'first_stage_loss_clip': loss_clip.item(),
+    #                             'first_stage_loss_ortho': loss_ortho_coop.item(),
+    #                             'first_stage_iteration': i})
+
+    #                 pbar.update(1)
+    #                 pbar.set_postfix({'loss': loss.item()}, refresh=False)
+
+    #     # END-TASK
+    #     opt.zero_grad(set_to_none=True)
+    #     del opt
+    #     torch.cuda.empty_cache()
+
+    #     # Generative replay after end of task
+    #     if self.args.enable_gr:
+    #         # 为生成式回放创建一个适配器
+    #         dataset_adapter = LibContinualDatasetAdapter(dataset, current_task)
+    #         self.first_stage.prompter.update_statistics(dataset_adapter, current_task)
+    #         self.first_stage.prompter.align(current_task)
+
+    #     # 评估适配
+    #     cur_acc = self.eval_first_stage_on_task_libcontinual(dataset, current_task, n_seen_classes)
+    #     logging.info(f'First stage accuracy: {[acc.item() for acc in cur_acc]}')
+    #     logging.info(f'\tAverage: {cur_acc.mean().item():.4f}')
+    #     if not self.args.nowand:
+    #         assert wandb is not None, "wandb is not installed."
+    #         log_dict = {f'first_stage_acc_{i}': acc.item() for i, acc in enumerate(cur_acc)}
+    #         log_dict['first_stage_acc'] = cur_acc.mean().item()
+    #         wandb.log(log_dict)
+
+    #     # 恢复原始transforms
+    #     train_loader.dataset.trfms = old_train_transform
+    #     if test_loaders is not None:
+    #         if isinstance(test_loaders, list):
+    #             test_loaders[-1].dataset.trfms = old_test_transform
+    #         else:
+    #             test_loaders.dataset.trfms = old_test_transform
+
+    #     self.first_stage.prompter.clip_model.float()  # 转换回float32
+    #     self.first_stage.prompter.text_encoder.dtype = torch.float32
+    #     self.first_stage.train(was_training)
+
+
+    @torch.no_grad()
+    def eval_first_stage_on_task_libcontinual(self, dataset: ContinualDatasets, current_task: int, n_seen_classes: int) -> torch.Tensor:
+        """
+        适配LibContinual的第一阶段评估函数
+        计算并返回每个任务的准确率
+        """
+        was_training = self.first_stage.training
+        self.first_stage.eval()
+        all_accs = []
+        
+        # 获取所有已见任务的测试数据
+        # 创建一个临时的测试数据集对象来获取测试加载器
+        test_dataset = ContinualDatasets(
+            dataset.dataset, 'test', dataset.task_num, dataset.init_cls_num, 
+            dataset.inc_cls_num, dataset.data_root, dataset.cls_map, dataset.trfms, 
+            dataset.batchsize, dataset.num_workers, dataset.config
+        )
+        
+        # 计算总长度用于进度条
+        total_batches = 0
+        for t in range(current_task + 1):
+            test_loader = test_dataset.get_loader(t)
+            if isinstance(test_loader, list):
+                total_batches += sum(len(loader) for loader in test_loader)
+            else:
+                total_batches += len(test_loader)
+        
+        with tqdm(total=total_batches, desc='Eval first stage on seen tasks') as pbar:
+            for t in range(current_task + 1):
+                test_loader = test_dataset.get_loader(t)
+                # 处理LibContinual的test loader可能是单个loader或loader列表的情况
+                test_loaders = test_loader if isinstance(test_loader, list) else [test_loader]
+                
+                for loader in test_loaders:
+                    total = 0
+                    correct = 0
+                    for data in loader:
+                        # 适配LibContinual的数据格式
+                        inputs = data["image"].to(self.device)
+                        labels = data["label"].to(self.device, dtype=torch.long)
+                        
+                        logits = self.first_stage(inputs, cur_classes=n_seen_classes)[:, :n_seen_classes]
+                        _, predicted = torch.max(logits, 1)
+                        total += labels.size(0)
+                        correct += (predicted == labels).sum().item()
+                        pbar.update(1)
+                    
+                    all_accs.append(correct / total)
+        
+        self.first_stage.train(was_training)
+        return torch.tensor(all_accs)
+
 
 class STARPrompt(Finetune):
     """
@@ -288,7 +493,7 @@ class STARPrompt(Finetune):
         args = Namespace()
 
         # First stage arguments
-        args.clip_backbone = kwargs.get('clip_backbone', 'ViT-B/32')
+        args.clip_backbone = kwargs.get('clip_backbone', 'ViT-L/14')
         args.first_stage_lr = kwargs.get('first_stage_lr', 0.002)
         args.first_stage_epochs = kwargs.get('first_stage_epochs', 10)
         args.first_stage_optim = kwargs.get('first_stage_optim', 'sgd')
