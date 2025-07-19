@@ -24,6 +24,7 @@ try:
 except ImportError:
     wandb = None
 
+import logging
 
 class TextEncoder(torch.nn.Module):
     """Text encoder for CLIP model"""
@@ -383,4 +384,3 @@ class FirstStageModel(torch.nn.Module):
         self.train(was_training)
 
 
-import logging

@@ -2,13 +2,15 @@
 Second stage prompter for STAR-Prompt.
 Handles CLIP-based prompting for the Vision Transformer.
 """
-
+from argparse import Namespace
 import os
 import logging
 import torch
 import torch.nn as nn
 from typing import List
 from kornia.augmentation import Normalize
+from .templates import templates
+import json
 # from kornia.enhance import Denormalize 
 
 try:
@@ -83,18 +85,51 @@ class Prompter(torch.nn.Module):
         logging.info("Loading CLIP visual encoder and the pre-computed text features...")
         clip_backbone = 'ViT-L/14' if not hasattr(args, 'clip_backbone') else args.clip_backbone
 
-        if clip_model is None:
-            self.clip_model, self.clip_preprocess = clip.load(clip_backbone, self.device)
-            self.clip_model = self.clip_model.float()
+        # if clip_model is None:
+        #     self.clip_model, self.clip_preprocess = clip.load(clip_backbone, self.device)
+        #     self.clip_model = self.clip_model.float()
+        # else:
+        #     self.clip_model = clip_model
+        #     self.clip_preprocess = clip_preprocess
+
+        # # Store CLIP embedding dimension
+        # self.clip_embed_dim = self.clip_model.visual.output_dim
+
+        # # Initialize keys (will be set from first stage)
+        # self.keys = torch.zeros(num_classes, self.clip_embed_dim, device=device)
+
+
+        # ！！！ 改了这一段， ⭐ 核心部分：复现mammoth的keys加载逻辑
+        self.keys_ckpt_path = None
+        self.old_args = None
+        
+        if hasattr(args, 'keys_ckpt_path') and args.keys_ckpt_path is not None:
+            # 第一阶段有checkpoint的情况
+            self.keys_ckpt_path = self._resolve_keys_path(args)
+            
+            if self.keys_ckpt_path and os.path.exists(self.keys_ckpt_path):
+                logging.info(f"Loading keys from checkpoint: {self.keys_ckpt_path}")
+                self.keys, first_stage_args = self.load_keys()
+                if first_stage_args is not None:
+                    logging.info(f"Keys loaded. Loading CLIP version: {first_stage_args.clip_backbone}")
+                    clip_backbone = first_stage_args.clip_backbone
+                    
+                if clip_model is None:
+                    self.clip_model, self.clip_preprocess = clip.load(clip_backbone, self.device)
+                    self.clip_model = self.clip_model.float()
+                else:
+                    self.clip_model = clip_model
+                    self.clip_preprocess = clip_preprocess
+            else:
+                # checkpoint不存在，使用默认模板
+                logging.warning(f"Keys checkpoint not found: {self.keys_ckpt_path}, using default templates")
+                self._initialize_with_templates(clip_model, clip_preprocess, clip_backbone)
         else:
-            self.clip_model = clip_model
-            self.clip_preprocess = clip_preprocess
+            self.keys_ckpt_path = None
+            # 没有指定checkpoint，使用默认模板
+            logging.info("No keys checkpoint specified, using default CLIP templates")
+            self._initialize_with_templates(clip_model, clip_preprocess, clip_backbone)
 
-        # Store CLIP embedding dimension
-        self.clip_embed_dim = self.clip_model.visual.output_dim
-
-        # Initialize keys (will be set from first stage)
-        self.keys = torch.zeros(num_classes, self.clip_embed_dim, device=device)
 
         # Setup CLIP preprocessing
         self.clip_normalization = Normalize(
@@ -148,9 +183,10 @@ class Prompter(torch.nn.Module):
         for p in self.clip_model.parameters():
             p.requires_grad = False
 
-        # Initialize prompt parameters for each layer
-        logging.info(f"Initializing prompts with target_embed_dim: {self.target_embed_dim}, clip_embed_dim: {self.clip_embed_dim}")
-        
+        # 获取CLIP embedding dimension
+        self.clip_embed_dim = self.clip_model.visual.output_dim
+        logging.info(f"CLIP embedding dimension: {self.clip_embed_dim}")
+
         for l in self.prompt_layers:
             if args.prompt_mode == 'residual':
                 # NOTE: this initialization follows that of CODA-Prompt.
@@ -181,10 +217,119 @@ class Prompter(torch.nn.Module):
             if l == 0:  # Only log for first layer
                 logging.info(f"Layer {l}: Created attention weights with shape {attn_param.shape}")
 
+
+    def _resolve_keys_path(self, args):
+        """解析keys checkpoint路径"""
+        keys_ckpt_path = args.keys_ckpt_path
+        
+        if keys_ckpt_path.endswith('.json'):
+            # JSON格式：{dataset: {seed: job_id}}
+            try:
+                with open(keys_ckpt_path, 'r') as f:
+                    key_mapping = json.load(f)
+                
+                dataset_name = getattr(args, 'dataset', 'unknown')
+                seed = str(getattr(args, 'seed', 1993))
+                
+                if dataset_name in key_mapping and seed in key_mapping[dataset_name]:
+                    key_jobnum = key_mapping[dataset_name][seed]
+                    # 构造文件路径（简化版本，不依赖dataset.N_TASKS）
+                    resolved_path = f"coop_keys/coop_keys_{key_jobnum}.pt"
+                else:
+                    logging.warning(f"Key mapping not found for dataset: {dataset_name}, seed: {seed}")
+                    return None
+                    
+            except Exception as e:
+                logging.error(f"Error reading JSON keys file: {e}")
+                return None
+                
+        elif keys_ckpt_path.endswith('.pt'):
+            # 直接的.pt文件
+            resolved_path = keys_ckpt_path
+        else:
+            # job_id字符串，构造文件路径
+            resolved_path = f"coop_keys/coop_keys_{keys_ckpt_path}.pt"
+            
+        return resolved_path
+    
+    def _initialize_with_templates(self, clip_model, clip_preprocess, clip_backbone):
+        """使用默认模板初始化"""
+        if clip_model is None:
+            self.clip_model, self.clip_preprocess = clip.load(clip_backbone, self.device)
+            self.clip_model = self.clip_model.float()
+        else:
+            self.clip_model = clip_model
+            self.clip_preprocess = clip_preprocess
+            
+        # 生成默认的类名
+        dataset_classes = [f"class_{i}" for i in range(self.num_classes)]
+        
+        # 生成默认的prompt模板, 这里的内容在 mammoth 中
+        default_templates = templates['imagenet']
+        
+        self.keys = self.load_default_prompt_templates(default_templates, dataset_classes)
+
+    
+    @torch.no_grad()
+    def load_default_prompt_templates(self, templates: List[str], dataset_classes: List[str]) -> torch.Tensor:
+        """从mammoth复制的函数"""
+        if hasattr(self.args, 'statc_keys_use_templates') and self.args.statc_keys_use_templates:
+            all_features = []
+            for t in templates:
+                text_inputs = torch.cat([clip.tokenize(t.format(c)) for c in dataset_classes]).to(self.device)
+                text_features = self.clip_model.encode_text(text_inputs)
+                all_features.append(text_features)
+            text_features = torch.stack(all_features).mean(dim=0)
+        else:
+            text_inputs = torch.cat([clip.tokenize(f"a photo of a {c}") for c in dataset_classes]).to(self.device)
+            text_features = self.clip_model.encode_text(text_inputs)
+        text_features /= text_features.norm(dim=-1, keepdim=True)
+        return text_features.float()
+
+    @torch.no_grad()
+    def load_keys(self):
+        """从mammoth复制的函数"""
+        if not self.keys_ckpt_path or not os.path.exists(self.keys_ckpt_path):
+            logging.warning(f"Keys checkpoint not found: {self.keys_ckpt_path}")
+            return None, None
+            
+        logging.info(f'Loading keys from {self.keys_ckpt_path}')
+        try:
+            st = torch.load(self.keys_ckpt_path, weights_only=True)
+        except Exception as e:
+            logging.error(f"Error loading checkpoint: {e}")
+            return None, None
+        
+        if isinstance(st, dict):
+            keys = st['keys'].to(self.device)
+            try:
+                old_args = Namespace(**st['args'])
+                # 验证兼容性
+                assert self.num_classes == keys.shape[0], f"Class number mismatch: {self.num_classes} vs {keys.shape[0]}"
+                # 可以添加更多验证...
+            except Exception as e:
+                logging.warning(f"Args validation failed: {e}")
+                old_args = None
+        else:
+            keys = st.to(self.device)
+            old_args = None
+            assert self.num_classes == keys.shape[0], f"Class number mismatch: {self.num_classes} vs {keys.shape[0]}"
+            
+        logging.info(f'Keys loaded successfully with shape: {keys.shape}')
+        return keys.float(), old_args
+
+
     def set_keys(self, keys: torch.Tensor, start_class: int, end_class: int):
         """Set the keys for the classes in the range [start_class, end_class)"""
         assert end_class - start_class == keys.shape[0], 'Number of classes in the keys tensor does not match the range'
         self.keys[start_class:end_class] = keys
+
+    def update_keys_from_first_stage(self, first_stage_keys: torch.Tensor):
+        """从第一阶段更新所有keys（LibContinual特有的动态更新方法）"""
+        self.keys = first_stage_keys.clone().to(self.device)
+        logging.info(f"Updated all keys from first stage, shape: {self.keys.shape}")
+
+    
 
     def get_parameter(self, shape, type_init: str = 'orto') -> torch.nn.Parameter:
         """Create and initialize a parameter tensor"""

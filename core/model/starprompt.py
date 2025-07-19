@@ -22,6 +22,8 @@ from .starprompt_utils.first_stage_model import FirstStageModel
 from .starprompt_utils.second_stage_model import SecondStageModel
 from .starprompt_utils.generative_replay import Gaussian, MixtureOfGaussiansModel
 from core.utils.utils import count_parameters
+from core.utils.conf import create_seeded_dataloader
+
 
 try:
     import wandb
@@ -132,7 +134,6 @@ class STARPromptModel(nn.Module):
         features = torch.cat(features, dim=0)
         labels = torch.cat(labels, dim=0).long()
 
-        from core.utils.conf import create_seeded_dataloader
         return create_seeded_dataloader(
             self.args,
             TensorDataset(features, labels),
