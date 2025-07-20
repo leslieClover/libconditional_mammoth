@@ -65,7 +65,7 @@ class SecondStageModel(nn.Module):
             num_heads=12,
             drop_path_rate=0,
             num_classes=num_classes,
-            prompt_mode=args.prompt_mod
+            prompt_mode=args.prompt_mode
         ).to(device)
 
         # logging.info("Loading the Vision Transformer backbone...")

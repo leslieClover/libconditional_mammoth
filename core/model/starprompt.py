@@ -456,8 +456,17 @@ class STARPrompt(Finetune):
             # Update statistics
             self.network.update_statistics(dataset, n_past_classes, self._known_classes)
 
-            # Alignment step
-            self.network.align(task_idx, self._known_classes, self.loss_fn)
+             # 对应Mammoth的: if self.current_task > 0:
+            if task_idx > 0:
+                # 对应Mammoth的: if self.args.seed is not None: torch.manual_seed(self.args.seed)
+                if hasattr(self.args, 'seed') and self.args.seed is not None:
+                    torch.manual_seed(self.args.seed)
+                
+                # 对应Mammoth的: self.net.align(self.current_task, self.n_seen_classes, self.loss)
+                self.network.align(task_idx,self._known_classes , self.loss_fn)
+
+            # # Alignment step
+            # self.network.align(task_idx, self._known_classes, self.loss_fn)
 
     def inference(self, data):
         """Inference step"""
@@ -472,16 +481,34 @@ class STARPrompt(Finetune):
 
         return pred, acc
 
+    def forward(self, x):
+        logits = self.net(x, cur_classes=self._known_classes)
+        logits = logits[:, :self._known_classes]
+        return logits
+
     def get_parameters(self, config):
-        """Get model parameters for LibContinual framework"""
-        # 返回所有需要训练的参数，让框架创建优化器
+        """
+        Get model parameters for LibContinual framework
+        按照Mammoth版本，只返回第二阶段的参数
+        """
+        # 检查是否已经初始化完成
+        if not hasattr(self, 'network') or not isinstance(self.network, STARPromptModel):
+            # 初始化阶段，返回所有参数
+            train_parameters = []
+            for name, param in self.network.named_parameters():
+                if param.requires_grad:
+                    train_parameters.append(param)
+            return train_parameters
+        
+        # 正常运行阶段，只返回第二阶段的参数（对应Mammoth的self.net.second_stage.parameters()）
         train_parameters = []
         
-        # 获取所有需要梯度的参数
-        for name, param in self.network.named_parameters():
+        # 只获取第二阶段的参数
+        for name, param in self.network.second_stage.named_parameters():
             if param.requires_grad:
                 train_parameters.append(param)
         
-        logging.info(f"Total trainable parameters: {len(train_parameters)}")
+        logging.info(f"Training only second stage parameters: {len(train_parameters)}")
+        logging.info(f"First stage parameters are frozen")
         
         return train_parameters

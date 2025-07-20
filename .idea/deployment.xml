@@ -1,6 +1,6 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <project version="4">
-  <component name="PublishConfigData" autoUpload="On explicit save action" serverName="root@connect.nmb2.seetacloud.com:16619 password" remoteFilesAllowedToDisappearOnAutoupload="false">
+  <component name="PublishConfigData" autoUpload="On explicit save action" serverName="root@connect.nmb2.seetacloud.com:24085 password (2)" remoteFilesAllowedToDisappearOnAutoupload="false">
     <serverData>
       <paths name="abaka@relay.molardata.com:31513 password">
         <serverdata>
@@ -30,6 +30,13 @@
           </mappings>
         </serverdata>
       </paths>
+      <paths name="root@connect.nmb2.seetacloud.com:16619 password (2)">
+        <serverdata>
+          <mappings>
+            <mapping local="$PROJECT_DIR$" web="/" />
+          </mappings>
+        </serverdata>
+      </paths>
       <paths name="root@connect.nmb2.seetacloud.com:24085 password (2)">
         <serverdata>
           <mappings>
@@ -41,6 +48,13 @@
         <serverdata>
           <mappings>
             <mapping deploy="/root/autodl-tmp/libContinual" local="$PROJECT_DIR$" />
+          </mappings>
+        </serverdata>
+      </paths>
+      <paths name="root@connect.nmb2.seetacloud.com:26291 password (2)">
+        <serverdata>
+          <mappings>
+            <mapping local="$PROJECT_DIR$" web="/" />
           </mappings>
         </serverdata>
       </paths>
