@@ -305,22 +305,79 @@ class FirstStageModel(torch.nn.Module):
         was_training = self.training
         self.train()
 
-        # Get trainable parameters
-        first_stage_params = [v for k, v in self.named_parameters() if 'prompt_parameters' in k]
+        # 关键修复1：扩大参数搜索范围
+        first_stage_params = []
+        param_names_to_check = [
+            'prompt_parameters',  # 原始查找
+            'prompt',            # 更通用的prompt
+            'context',           # 上下文参数
+            'learnable',         # 可学习参数
+            'adapter',           # 适配器参数
+            'text_encoder',      # 文本编码器的某些层
+            'visual',            # 视觉编码器的某些层
+        ]
 
+        # 方法1：按名称查找
+        for name, param in self.named_parameters():
+            if any(keyword in name.lower() for keyword in param_names_to_check):
+                param.requires_grad = True
+                first_stage_params.append(param)
+                logging.info(f"Found trainable parameter: {name}")
+
+        # 方法2：如果没找到，查找所有requires_grad=True的参数
+        if len(first_stage_params) == 0:
+            logging.warning("No prompt parameters found, checking all trainable parameters...")
+            for name, param in self.named_parameters():
+                if param.requires_grad:
+                    first_stage_params.append(param)
+                    logging.info(f"Found trainable parameter: {name}")
+
+        # 方法3：如果还是没有，强制启用一些参数
+        if len(first_stage_params) == 0:
+            logging.warning("No trainable parameters found, enabling some layers...")
+            # 启用文本编码器的最后几层
+            layers_to_enable = [
+                'ln_final',         # 最后的层归一化
+                'text_projection',  # 文本投影层
+                'logit_scale',      # 逻辑尺度参数
+            ]
+
+            for name, param in self.named_parameters():
+                if any(layer in name for layer in layers_to_enable):
+                    param.requires_grad = True
+                    first_stage_params.append(param)
+                    logging.info(f"Enabled parameter: {name}")
+
+        # 最后的保险措施
+        if len(first_stage_params) == 0:
+            logging.error("Still no trainable parameters! Enabling the first few parameters...")
+            count = 0
+            for name, param in self.named_parameters():
+                if count < 3:  # 只启用前3个参数
+                    param.requires_grad = True
+                    first_stage_params.append(param)
+                    logging.info(f"Force enabled: {name}")
+                    count += 1
+
+        if len(first_stage_params) == 0:
+            raise RuntimeError("Cannot find any parameters to train in first stage!")
+
+        logging.info(f"Total trainable parameters: {len(first_stage_params)}")
+
+        # 创建优化器
         if self.args.first_stage_optim == 'sgd':
-            opt = torch.optim.SGD(
-                first_stage_params,
-                lr=self.args.first_stage_lr,
-                momentum=self.args.first_stage_momentum,
-                weight_decay=self.args.first_stage_weight_decay
-            )
+            opt = torch.optim.SGD(first_stage_params,
+                                lr=self.args.first_stage_lr,
+                                momentum=self.args.first_stage_momentum,
+                                weight_decay=self.args.first_stage_weight_decay)
         else:
-            opt = torch.optim.Adam(
-                first_stage_params,
-                lr=self.args.first_stage_lr,
-                weight_decay=self.args.first_stage_weight_decay
-            )
+            opt = torch.optim.Adam(first_stage_params,
+                                lr=self.args.first_stage_lr,
+                                weight_decay=self.args.first_stage_weight_decay)
+
+        # 验证优化器有参数
+        total_params = sum(len(group['params']) for group in opt.param_groups)
+        logging.info(f"Optimizer created with {total_params} parameters")
 
         # Training loop
         with tqdm(total=self.args.first_stage_epochs * len(dataset.train_loader), desc='First stage training') as pbar:

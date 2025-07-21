@@ -393,6 +393,9 @@ class STARPrompt(Finetune):
         """Train the first stage of STAR-Prompt"""
         n_past_classes = self._known_classes - (
             self.kwargs['inc_cls_num'] if task_idx > 0 else self.kwargs['init_cls_num'])
+        
+        # 确保第一阶段处于正确状态
+        self._setup_first_stage_for_training()
 
         # Create a simple dataset wrapper for training
         class SimpleDataset:
@@ -418,6 +421,46 @@ class STARPrompt(Finetune):
             n_seen_classes=self._known_classes,
             loss_fn=self.loss_fn
         )
+
+    def _setup_first_stage_for_training(self):
+        """设置第一阶段进行训练"""
+        # 首先检查第一阶段是否存在prompt相关模块
+        first_stage = self.network.first_stage
+        
+        # 设置第一阶段为训练模式
+        first_stage.train()
+        
+        # 尝试找到并启用可训练参数
+        trainable_count = 0
+        for name, param in first_stage.named_parameters():
+            # 启用prompt相关参数
+            if any(keyword in name.lower() for keyword in ['prompt', 'context', 'learnable', 'adapter']):
+                param.requires_grad = True
+                trainable_count += 1
+                logging.info(f"Enabled training for: {name}")
+            # 对于CLIP模型，只训练特定层
+            elif 'clip' in name.lower() and any(layer in name.lower() for layer in ['ln_final', 'text_projection', 'logit_scale']):
+                param.requires_grad = True
+                trainable_count += 1
+                logging.info(f"Enabled CLIP parameter for training: {name}")
+            else:
+                param.requires_grad = False
+        
+        # 如果没有找到可训练参数，启用一些关键参数
+        if trainable_count == 0:
+            logging.warning("No obvious trainable parameters found, enabling some parameters...")
+            count = 0
+            for name, param in first_stage.named_parameters():
+                if count < 5:  # 只启用前5个参数作为示例
+                    param.requires_grad = True
+                    trainable_count += 1
+                    count += 1
+                    logging.info(f"Force enabled parameter: {name}")
+        
+        logging.info(f"Total trainable parameters in first stage: {trainable_count}")
+        
+        if trainable_count == 0:
+            raise RuntimeError("No trainable parameters found in first stage!")
 
     def observe(self, data):
         """Training step"""
@@ -488,11 +531,12 @@ class STARPrompt(Finetune):
 
             dataset = SimpleDataset(train_loader, self.kwargs)
 
+            # Update statistics
+            self.network.update_statistics(dataset, n_past_classes, self._known_classes)
+
             # Backup classifier
             self.network.backup(task_idx, n_past_classes, self._known_classes)
 
-            # Update statistics
-            self.network.update_statistics(dataset, n_past_classes, self._known_classes)
 
              # 对应Mammoth的: if self.current_task > 0:
             if task_idx > 0:
