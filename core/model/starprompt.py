@@ -23,7 +23,9 @@ from .starprompt_utils.second_stage_model import SecondStageModel
 from .starprompt_utils.generative_replay import Gaussian, MixtureOfGaussiansModel
 from core.utils.utils import count_parameters
 from core.utils.conf import create_seeded_dataloader
+from core.scheduler import CosineSchedule
 
+print("lalallaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
 
 try:
     import wandb
@@ -279,6 +281,10 @@ class STARPrompt(Finetune):
         # Loss function
         self.loss_fn = nn.CrossEntropyLoss()
 
+        self.virtual_bs_n = kwargs.get('virtual_bs_n', 1)
+        self.accumulated_loss = 0.0
+        self.accumulation_count = 0
+
         logging.info(f"STAR-Prompt initialized with parameters")
 
     def _setup_args(self, kwargs):
@@ -341,6 +347,8 @@ class STARPrompt(Finetune):
         self.task_idx = task_idx
         self.current_task = task_idx
 
+        torch.cuda.empty_cache()
+
         # Update known classes
         if task_idx == 0:
             self._known_classes = self.kwargs['init_cls_num']
@@ -355,10 +363,31 @@ class STARPrompt(Finetune):
             self.kwargs['inc_cls_num'] if task_idx > 0 else self.kwargs['init_cls_num'])
         self.network.update_keys(n_past_classes, self._known_classes)
 
+        self.network.second_stage.train()
+
         # 关键修改：在这里调用recall_classifier_second_stage
         self.network.recall_classifier_second_stage(task_idx, n_past_classes, self._known_classes)
-        # # Setup optimizer for second stage
-        # self._setup_second_stage_optimizer()
+
+        # 但我们需要确保参数设置正确
+        self._setup_second_stage_training()
+
+    def _setup_second_stage_training(self):
+        """
+        设置第二阶段训练的相关配置
+        """
+        # 确保第二阶段参数可训练
+        for name, param in self.network.second_stage.named_parameters():
+            param.requires_grad = True
+        
+        # 确保第一阶段参数冻结
+        for name, param in self.network.first_stage.named_parameters():
+            param.requires_grad = False
+        
+        # logging.info("Second stage training setup completed")
+
+
+    def get_scheduler(self):
+        return CosineSchedule(self.opt, K=self.args.n_epochs)
 
     def _train_first_stage(self, train_loader, task_idx):
         """Train the first stage of STAR-Prompt"""
@@ -396,37 +425,46 @@ class STARPrompt(Finetune):
         x = x.to(self.device)
         y = y.to(self.device)
 
-        # Forward pass
+        # 计算类别数量
         n_past_classes = self._known_classes - (
             self.kwargs['inc_cls_num'] if self.task_idx > 0 else self.kwargs['init_cls_num'])
 
+        # Forward pass
         logits = self.network(x, cur_classes=self._known_classes, frozen_past_classes=n_past_classes)
 
-        # # Compute loss
-        # loss = self.loss_fn(logits, y)
-        # ⭐ 关键修复: 屏蔽过去类别的logits，防止灾难性遗忘
-        # 这个步骤确保模型在当前任务训练时不会"忘记"过去任务的决策边界
         if n_past_classes > 0:
             logits[:, :n_past_classes] = -float('inf')
+
+        with torch.no_grad():
+            stream_preds = logits[:, :self._known_classes].argmax(dim=1)
+            stream_acc = (stream_preds == y).sum().item() / y.shape[0]
 
         # 只对当前可见的类别计算损失
         loss = self.loss_fn(logits[:, :self._known_classes], y)
 
-        # Add orthogonality loss
-        if n_past_classes > 0:
-            ortho_loss = self.network.second_stage.prompter.compute_ortho_loss(
-                cur_classes=self._known_classes,
-                frozen_past_classes=n_past_classes
-            )
-            loss += self.args.lambda_ortho_second_stage * ortho_loss
+        ortho_loss = self.network.second_stage.prompter.compute_ortho_loss(
+            cur_classes=self._known_classes,
+            frozen_past_classes=n_past_classes
+        )
+        loss += self.args.lambda_ortho_second_stage * ortho_loss
 
-        # 不在这里执行反向传播 - 让框架处理
-        # 框架会调用loss.backward()和optimizer.step()
+        
+        # 虚拟批量大小处理（与Mammoth一致）
+        if hasattr(self.args, 'virtual_bs_n') and self.args.virtual_bs_n > 1:
+            loss = loss / self.args.virtual_bs_n
 
-        pred = torch.argmax(logits, dim=1)
-        acc = torch.sum(pred == y).item() / x.size(0)
+        # 计算准确率（用于日志记录，与Mammoth一致）
+        with torch.no_grad():
+            stream_preds = logits[:, :self._known_classes].argmax(dim=1)
+            stream_acc = (stream_preds == y).sum().item() / y.shape[0]
+
+        # 返回预测和准确率
+        pred = torch.argmax(logits[:, :self._known_classes], dim=1)
+        acc = stream_acc  # 使用与Mammoth一致的准确率计算
 
         return pred, acc, loss
+
+
 
     def after_task(self, task_idx, buffer, train_loader, test_loaders):
         """Called after each task"""

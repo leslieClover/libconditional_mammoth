@@ -27,7 +27,7 @@ if __name__ == "__main__":
         args.config = args.config + '.yaml' if not args.config.endswith('.yaml') else args.config
         config = Config(f'./config/{args.config}').get_config_dict()
     else:
-        config = Config("./config/InfLoRA.yaml").get_config_dict()    
+        config = Config("./config/starprompt.yaml").get_config_dict()
 
     if config['device_ids'] == 'auto':
         least_utilized_device = 0

@@ -6,6 +6,8 @@ task_num: &task_num 10
 image_size: &image_size 224
 
 
+virtual_bs_n: 1 
+
 epoch: 20
 val_per_epoch: 20
 
