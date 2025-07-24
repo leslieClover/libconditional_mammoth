@@ -562,6 +562,12 @@ class Trainer(object):
             if self.config['classifier']['name'] in ['MOE_ADAPTER4CL', 'DMNSP', 'DMNSP_CIL']:
                 self.scheduler.step(total * epoch_idx + b)
 
+            # ⭐ 新增：为starprompt设置optimizer引用
+            if self.config["classifier"]["name"] in ['starprompt']:
+                if hasattr(model, 'set_optimizer'):
+                    model.set_optimizer(self.optimizer)
+
+        
             if self.config["classifier"]["name"] in ['TRGP', 'DMNSP', 'DMNSP_CIL', 'TRGP_CLIP', 
                                                     'GPM', 'MoE_Test2', 'API', 'L2P']:
                 self.optimizer.zero_grad()
@@ -570,12 +576,18 @@ class Trainer(object):
                 output, acc, loss = model.observe(batch)
                 self.optimizer.zero_grad()
                 loss.backward(retain_graph=True)
+
+            elif self.config["classifier"]["name"] in ['starprompt']:
+                output, acc, loss = model.observe(batch)
             else:
                 output, acc, loss = model.observe(batch)
                 self.optimizer.zero_grad()
                 loss.backward()
 
-            self.optimizer.step()
+            # self.optimizer.step()
+
+            if not (self.config["classifier"]["name"] in ['starprompt']):
+                self.optimizer.step()
 
             if self.config["classifier"]["name"] in ['ERACE', 'ERAML']:
                 model.add_reservoir()

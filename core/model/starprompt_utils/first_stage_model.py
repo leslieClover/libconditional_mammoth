@@ -364,6 +364,8 @@ class FirstStageModel(torch.nn.Module):
 
         logging.info(f"Total trainable parameters: {len(first_stage_params)}")
 
+        # ----
+
         # 创建优化器
         if self.args.first_stage_optim == 'sgd':
             opt = torch.optim.SGD(first_stage_params,
@@ -375,9 +377,9 @@ class FirstStageModel(torch.nn.Module):
                                 lr=self.args.first_stage_lr,
                                 weight_decay=self.args.first_stage_weight_decay)
 
-        # 验证优化器有参数
-        total_params = sum(len(group['params']) for group in opt.param_groups)
-        logging.info(f"Optimizer created with {total_params} parameters")
+        # # 验证优化器有参数
+        # total_params = sum(len(group['params']) for group in opt.param_groups)
+        # logging.info(f"Optimizer created with {total_params} parameters")
 
         # Training loop
         with tqdm(total=self.args.first_stage_epochs * len(dataset.train_loader), desc='First stage training') as pbar:

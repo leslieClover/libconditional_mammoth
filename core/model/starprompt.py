@@ -25,7 +25,6 @@ from core.utils.utils import count_parameters
 from core.utils.conf import create_seeded_dataloader
 from core.scheduler import CosineSchedule
 
-print("lalallaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
 
 try:
     import wandb
@@ -171,7 +170,9 @@ class STARPromptModel(nn.Module):
                 logits = logits / (0.1 * norm)
 
                 loss = loss_fn(logits, labels)
+                print(173)
                 loss.backward()
+                print(176)
                 optim.step()
 
                 if not self.args.nowand and wandb is not None:
@@ -245,11 +246,206 @@ class STARPromptModel(nn.Module):
         self.second_stage.vit.head.weight.data.copy_(self.classifier_state_dict['weight'].data)
         self.second_stage.vit.head.bias.data.copy_(self.classifier_state_dict['bias'].data)
 
+    # @torch.enable_grad()
+    # def train_first_stage_on_task(self, dataset, current_task: int, n_past_classes: int, n_seen_classes: int, loss_fn):
+    #     """Train the first stage on the current task"""
+    #     return self.first_stage.train_first_stage_on_task(dataset, current_task, n_past_classes, n_seen_classes,
+    #                                                       loss_fn)
     @torch.enable_grad()
     def train_first_stage_on_task(self, dataset, current_task: int, n_past_classes: int, n_seen_classes: int, loss_fn):
-        """Train the first stage on the current task"""
-        return self.first_stage.train_first_stage_on_task(dataset, current_task, n_past_classes, n_seen_classes,
-                                                          loss_fn)
+        """Train the first stage on the current task - 完全复现Mammoth逻辑"""
+        
+        logging.info(f"Starting training of first stage on task: {current_task}")
+        
+        # 步骤1: 保存原始transforms
+        # print(259)
+        train_loader = dataset if hasattr(dataset, '__iter__') else dataset.train_loader
+
+
+        # print(263)
+        # LibContinual数据格式处理 - 需要获取实际的dataset对象
+        if hasattr(train_loader, 'dataset'):
+            # print(266)
+            actual_dataset = train_loader.dataset
+            old_train_transform = actual_dataset.trfms if hasattr(actual_dataset, 'trfms') else None
+        else:
+            # 如果是简单的DataLoader
+            # print(272)
+            old_train_transform = None
+            actual_dataset = None
+        
+        try:
+            # 步骤2: 切换到CLIP预处理 (关键复现点)
+            # print(278)
+            if actual_dataset is not None:
+                logging.info("Switching to CLIP preprocessing for first stage training")
+                actual_dataset.trfms = self.first_stage.prompter.clip_preprocess
+            
+            # 步骤3: 设置CLIP模型为float16 (精确复现Mammoth)
+            # print(283)
+
+            convert_weights(self.first_stage.prompter.clip_model)
+            self.first_stage.prompter.text_encoder.dtype = torch.float16
+            # print(287)
+            
+            # 步骤4: 训练状态管理
+            was_training = self.first_stage.training
+            self.first_stage.train()
+            
+            # 步骤5: 获取可训练参数 (精确复现Mammoth逻辑)
+            # print(295)
+            first_stage_params = [v for k, v in self.first_stage.named_parameters() if 'prompt_parameters' in k]
+            # print(298)
+            if len(first_stage_params) == 0:
+                logging.warning("No 'prompt_parameters' found, searching for alternative parameter names...")
+                # 扩展搜索范围
+                # print(301)
+                alt_names = ['prompt', 'context', 'learnable', 'adapter', 'text_encoder']
+                for name, param in self.first_stage.named_parameters():
+                    if any(alt in name.lower() for alt in alt_names) and param.requires_grad:
+                        first_stage_params.append(param)
+                        logging.info(f"Found trainable parameter: {name}")
+            # print(308)
+            if len(first_stage_params) == 0:
+                raise RuntimeError("Cannot find trainable parameters in first stage!")
+            
+            # print(310)
+            
+            # 步骤6: 创建优化器 (完全复现Mammoth)
+            if self.args.first_stage_optim == 'sgd':
+                # print(315)
+                opt = torch.optim.SGD(first_stage_params, 
+                                    lr=self.args.first_stage_lr, 
+                                    momentum=self.args.first_stage_momentum,
+                                    weight_decay=self.args.first_stage_weight_decay)
+            else:
+                opt = torch.optim.Adam(first_stage_params, 
+                                    lr=self.args.first_stage_lr,
+                                    weight_decay=self.args.first_stage_weight_decay)
+            
+
+            # print(325)
+            with tqdm(total=self.args.first_stage_epochs * len(train_loader), 
+                    desc='First stage training') as pbar:
+                # print(328)
+                for epoch in range(self.args.first_stage_epochs):
+                    for i, data in enumerate(train_loader):
+                        if self.args.debug_mode and i > 3:
+                            break
+                        
+                        # LibContinual数据格式适配
+                        if isinstance(data, dict):
+                            inputs, labels = data['image'], data['label']
+                        else:
+                            inputs, labels = data[0], data[1]
+                        
+                        inputs = inputs.to(self.device)
+                        labels = labels.to(self.device, dtype=torch.long)
+                        
+                        loss = torch.tensor(0.).to(self.device)
+                        
+                        opt.zero_grad()
+                        
+                        # 前向传播
+                        clip_logits = self.first_stage(inputs, 
+                                                    frozen_past_classes=n_past_classes, 
+                                                    cur_classes=n_seen_classes)
+                        
+                        # 计算CLIP损失 (精确复现)
+                        clip_logits[:, :n_past_classes] = -float('inf')
+                        loss_clip = loss_fn(clip_logits[:, :n_seen_classes], labels)
+                        loss += loss_clip
+                        
+                        # 正交损失 (精确复现)
+                        loss_ortho_coop = self.first_stage.prompter.compute_ortho_loss(
+                            frozen_past_classes=n_past_classes, 
+                            cur_classes=n_seen_classes
+                        )
+                        loss += self.args.lambda_ortho_first_stage * loss_ortho_coop
+                        
+                        # 虚拟批次训练 (精确复现Mammoth逻辑)
+                        if i == 0:
+                            opt.zero_grad()
+                        (loss / self.args.virtual_bs_n).backward()
+                        if (i > 0 or self.args.virtual_bs_n == 1) and i % self.args.virtual_bs_n == 0:
+                            opt.step()
+                            opt.zero_grad()
+                        
+                        # Wandb日志记录 (可选)
+                        # if not self.args.nowand and wandb is not None:
+                        #     wandb.log({
+                        #         'first_stage_loss': loss.item(),
+                        #         'first_stage_lr': opt.param_groups[0]['lr'],
+                        #         'first_stage_epoch': epoch,
+                        #         'first_stage_loss_clip': loss_clip.item(),
+                        #         'first_stage_loss_ortho': loss_ortho_coop.item(),
+                        #         'first_stage_iteration': i
+                        #     })
+                        
+                        pbar.update(1)
+                        pbar.set_postfix({'loss': loss.item()}, refresh=False)
+            
+            # 步骤8: 清理优化器 (精确复现)
+            opt.zero_grad(set_to_none=True)
+            del opt
+            torch.cuda.empty_cache()
+            
+            # 步骤9: 生成重放 (精确复现Mammoth逻辑)
+            if self.args.enable_gr:
+                self.first_stage.prompter.update_statistics(dataset, current_task)
+                self.first_stage.prompter.align(current_task)
+            
+            # 步骤10: 评估第一阶段性能 (可选，需要实现eval方法)
+            # try:
+            #     cur_acc = self.eval_first_stage_on_task(dataset, n_seen_classes)
+            #     logging.info(f'First stage accuracy: {[acc.item() for acc in cur_acc]}')
+            #     logging.info(f'\tAverage: {cur_acc.mean().item():.4f}')
+            # except Exception as e:
+            #     logging.warning(f"First stage evaluation failed: {e}")
+            
+        finally:
+            # 步骤11: 恢复原始状态 (关键清理步骤)
+            if actual_dataset is not None and old_train_transform is not None:
+                logging.info("Restoring original transforms")
+                actual_dataset.trfms = old_train_transform
+            
+            # 恢复CLIP模型为float32
+            self.first_stage.prompter.clip_model.float()
+            self.first_stage.prompter.text_encoder.dtype = torch.float32
+            self.first_stage.train(was_training)
+        
+        print(422)
+        logging.info(f"First stage training completed for task {current_task}")
+
+    # @torch.no_grad()
+    # def eval_first_stage_on_task(self, dataset, n_seen_classes):
+    #     """评估第一阶段性能"""
+    #     self.first_stage.eval()
+        
+    #     # 简化版评估逻辑
+    #     total_samples = 0
+    #     correct_predictions = 0
+        
+    #     train_loader = dataset if hasattr(dataset, '__iter__') else dataset.train_loader
+        
+    #     with torch.no_grad():
+    #         for data in train_loader:
+    #             if isinstance(data, dict):
+    #                 inputs, labels = data['image'], data['label']
+    #             else:
+    #                 inputs, labels = data[0], data[1]
+                
+    #             inputs = inputs.to(self.device)
+    #             labels = labels.to(self.device)
+                
+    #             clip_logits = self.first_stage(inputs, cur_classes=n_seen_classes)
+    #             predictions = torch.argmax(clip_logits, dim=1)
+                
+    #             correct_predictions += (predictions == labels).sum().item()
+    #             total_samples += labels.size(0)
+        
+    #     accuracy = correct_predictions / total_samples if total_samples > 0 else 0.0
+    #     return torch.tensor([accuracy])  # 返回tensor格式以保持一致性
 
 
 class STARPrompt(Finetune):
@@ -285,6 +481,11 @@ class STARPrompt(Finetune):
         self.accumulated_loss = 0.0
         self.accumulation_count = 0
 
+        # 虚拟批次管理
+        self.virtual_batch_count = 0
+        self.epoch_iteration = 0
+        self.custom_optimizer = None
+
         logging.info(f"STAR-Prompt initialized with parameters")
 
     def _setup_args(self, kwargs):
@@ -294,7 +495,7 @@ class STARPrompt(Finetune):
         args = Namespace()
 
         # First stage arguments
-        args.clip_backbone = kwargs.get('clip_backbone', 'ViT-B/32')
+        args.clip_backbone = kwargs.get('clip_backbone', 'ViT-L/14')
         args.first_stage_lr = kwargs.get('first_stage_lr', 0.002)
         args.first_stage_epochs = kwargs.get('first_stage_epochs', 10)
         args.first_stage_optim = kwargs.get('first_stage_optim', 'sgd')
@@ -333,7 +534,7 @@ class STARPrompt(Finetune):
         args.debug_mode = kwargs.get('debug_mode', False)
         args.nowand = kwargs.get('nowand', True)
         args.dataset = kwargs.get('dataset', 'cifar100')
-        args.seed = kwargs.get('seed', 42)
+        args.seed = kwargs.get('seed', 1993)
         args.permute_classes = kwargs.get('permute_classes', False)
 
         # Framework specific
@@ -343,11 +544,16 @@ class STARPrompt(Finetune):
         return args
 
     def before_task(self, task_idx, buffer, train_loader, test_loaders):
-        """Called before each task"""
+        
+        """
+        Called before each task
+
+        这里还是有问题， 修改过
+        """
         self.task_idx = task_idx
         self.current_task = task_idx
 
-        torch.cuda.empty_cache()
+        torch.cuda.empty_cache()  # ！
 
         # Update known classes
         if task_idx == 0:
@@ -363,13 +569,65 @@ class STARPrompt(Finetune):
             self.kwargs['inc_cls_num'] if task_idx > 0 else self.kwargs['init_cls_num'])
         self.network.update_keys(n_past_classes, self._known_classes)
 
-        self.network.second_stage.train()
+        self.network.second_stage.train() # ！ 
+
+        # 关键修复：确保prompter参数可训练（这是Mammoth中的隐式行为）
+        self._ensure_prompter_trainable()
 
         # 关键修改：在这里调用recall_classifier_second_stage
         self.network.recall_classifier_second_stage(task_idx, n_past_classes, self._known_classes)
 
-        # 但我们需要确保参数设置正确
-        self._setup_second_stage_training()
+        # 创建独立的optimizer（完全复现Mammoth）
+        second_stage_params = self.get_parameters({})
+        
+        # 使用与Mammoth相同的设置，这里参数不好传进来
+        self.custom_optimizer = torch.optim.Adam(
+            second_stage_params, 
+            lr=0.001,  # 确保与Mammoth一致
+            weight_decay=0,
+            betas=(0.9, 0.999)
+        )
+        
+        # print(f"✅ Created independent optimizer with {len(second_stage_params)} parameters")
+
+        # # 但我们需要确保参数设置正确
+        # self._setup_second_stage_training() # ！
+        # 
+    def _ensure_prompter_trainable(self):
+        """确保prompter参数可训练 - 复现Mammoth的隐式行为"""
+        
+        # 激活prompter中的prompt参数
+        if hasattr(self.network.second_stage, 'prompter'):
+            prompter = self.network.second_stage.prompter
+            trainable_count = 0
+            
+            # 激活所有以 'p_' 或 'a_' 开头的参数（prompt和attention参数）
+            for name, param in prompter.named_parameters():
+                if name.startswith(('p_', 'a_')) or 'prompt' in name.lower():
+                    param.requires_grad = True
+                    trainable_count += 1
+                    logging.debug(f"Enabled prompter parameter: {name}")
+            
+            logging.info(f"Enabled {trainable_count} prompter parameters") 
+
+
+    def _create_dataset_wrapper(self, train_loader):
+        """创建数据集包装器"""
+        class DatasetWrapper:
+            def __init__(self, loader, kwargs):
+                self.train_loader = loader
+                self.kwargs = kwargs
+                self.test_loaders = [loader]
+            
+            def get_offsets(self, task_id):
+                if task_id == 0:
+                    return 0, self.kwargs['init_cls_num']
+                else:
+                    return self.kwargs['init_cls_num'] + (task_id - 1) * self.kwargs['inc_cls_num'], \
+                        self.kwargs['init_cls_num'] + task_id * self.kwargs['inc_cls_num']
+        
+        return DatasetWrapper(train_loader, self.kwargs)
+
 
     def _setup_second_stage_training(self):
         """
@@ -395,7 +653,7 @@ class STARPrompt(Finetune):
             self.kwargs['inc_cls_num'] if task_idx > 0 else self.kwargs['init_cls_num'])
         
         # 确保第一阶段处于正确状态
-        self._setup_first_stage_for_training()
+        self._setup_first_stage_for_training() # ！ 
 
         # Create a simple dataset wrapper for training
         class SimpleDataset:
@@ -475,15 +733,18 @@ class STARPrompt(Finetune):
         # Forward pass
         logits = self.network(x, cur_classes=self._known_classes, frozen_past_classes=n_past_classes)
 
-        if n_past_classes > 0:
-            logits[:, :n_past_classes] = -float('inf')
-
-        with torch.no_grad():
+        # ！ 
+        with torch.no_grad():  # ！ 
             stream_preds = logits[:, :self._known_classes].argmax(dim=1)
             stream_acc = (stream_preds == y).sum().item() / y.shape[0]
 
+        if n_past_classes > 0:
+            logits[:, :n_past_classes] = -float('inf')  # ！ 
+
         # 只对当前可见的类别计算损失
         loss = self.loss_fn(logits[:, :self._known_classes], y)
+
+        # ！ 
 
         ortho_loss = self.network.second_stage.prompter.compute_ortho_loss(
             cur_classes=self._known_classes,
@@ -491,23 +752,61 @@ class STARPrompt(Finetune):
         )
         loss += self.args.lambda_ortho_second_stage * ortho_loss
 
+        #         # Add orthogonality loss
+        # if n_past_classes > 0:
+        #     ortho_loss = self.network.second_stage.prompter.compute_ortho_loss(
+        #         cur_classes=self._known_classes,
+        #         frozen_past_classes=n_past_classes
+        #     )
+        #     loss += self.args.lambda_ortho_second_stage * ortho_loss
+
+            # 关键修复：检查optimizer状态
+        if not hasattr(self, 'custom_optimizer') or self.custom_optimizer is None:
+            print("❌ WARNING: custom_optimizer not set, using fallback")
+            # 应急方案：直接使用标准训练
+            pred = torch.argmax(logits[:, :self._known_classes], dim=1)
+            return pred, stream_acc, loss  # 让框架处理
         
-        # 虚拟批量大小处理（与Mammoth一致）
-        if hasattr(self.args, 'virtual_bs_n') and self.args.virtual_bs_n > 1:
-            loss = loss / self.args.virtual_bs_n
+        # 检查参数数量
+        total_params = sum(len(group['params']) for group in self.custom_optimizer.param_groups)
+        if total_params == 0:
+            print("❌ CRITICAL: No trainable parameters!")
+            pred = torch.argmax(logits[:, :self._known_classes], dim=1)
+            return pred, stream_acc, loss
 
-        # 计算准确率（用于日志记录，与Mammoth一致）
-        with torch.no_grad():
-            stream_preds = logits[:, :self._known_classes].argmax(dim=1)
-            stream_acc = (stream_preds == y).sum().item() / y.shape[0]
+        # 关键修复2：精确复制Mammoth的虚拟批次逻辑
+        if self.epoch_iteration == 0:
+            if self.custom_optimizer is not None:
+                self.custom_optimizer.zero_grad()
 
-        # 返回预测和准确率
+        # 精确复现Mammoth的梯度处理
+        (loss / self.args.virtual_bs_n).backward()
+
+        # 检查是否需要执行优化步骤（Mammoth的精确条件）
+        if (self.epoch_iteration > 0 or self.args.virtual_bs_n == 1) and \
+           self.epoch_iteration % self.args.virtual_bs_n == 0:
+            if self.custom_optimizer is not None:
+                self.custom_optimizer.step()
+                self.custom_optimizer.zero_grad()
+
+        # 更新迭代计数
+        self.epoch_iteration += 1
+
         pred = torch.argmax(logits[:, :self._known_classes], dim=1)
-        acc = stream_acc  # 使用与Mammoth一致的准确率计算
+        
+        # 使用loss的值但断开计算图
+        # print(769)
 
-        return pred, acc, loss
+        dummy_loss = torch.tensor(loss.item(), device=self.device, requires_grad=True)
+        # print(772)
 
-
+        return pred, stream_acc, dummy_loss
+    
+    def set_optimizer(self, optimizer):
+        """设置optimizer引用"""
+        self.custom_optimizer = optimizer
+        total_params = sum(len(group['params']) for group in optimizer.param_groups)
+        print(f"✅ STARPrompt: Set optimizer with {total_params} parameters")
 
     def after_task(self, task_idx, buffer, train_loader, test_loaders):
         """Called after each task"""
@@ -590,7 +889,7 @@ class STARPrompt(Finetune):
             if param.requires_grad:
                 train_parameters.append(param)
         
-        logging.info(f"Training only second stage parameters: {len(train_parameters)}")
-        logging.info(f"First stage parameters are frozen")
+        # logging.info(f"Training only second stage parameters: {len(train_parameters)}")
+        # logging.info(f"First stage parameters are frozen")
         
         return train_parameters
